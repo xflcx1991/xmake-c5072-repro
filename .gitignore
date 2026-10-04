@@ -1,0 +1,9 @@
+repro/build/
+repro/.xmake/
+repro/.vscode/
+*.orig
+probe.c
+probe.obj
+probe.exe
+*.pdb
+*.obj
