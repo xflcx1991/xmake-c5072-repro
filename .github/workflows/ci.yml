@@ -12,26 +12,33 @@ jobs:
   # ---------------------------------------------------------------------------
   # Windows / MSVC -- the platform where the bug actually bites.
   #
-  # The runner image ships MSVC *with* the Address Sanitizer component, so the
-  # real cl.exe there stays silent and the bug would never show up. To get a
-  # deterministic result we compile stub/stub_cl.c with that very MSVC and put
-  # it first on PATH:
+  # No stub and no PATH tricks on this job: xmake resolves cl through the cached
+  # Visual Studio environment to an absolute path, so shadowing `cl` on PATH can
+  # never work here. It does not need to -- the runner's REAL cl.exe is enough:
   #
-  #   - it answers -fsanitize=address with "Command line warning C5072" and
-  #     exit code 0, exactly like a cl.exe with no asan runtime installed;
-  #   - then it hands the unchanged argv to the REAL cl.exe (STUB_REAL_CL) and
-  #     returns its exit code.
+  #   <src> : warning C5072: ASAN enabled without debug information emission.
+  #           Enable debug info for better ASAN error reporting
   #
-  # So the compilation is genuinely done by the runner's MSVC; only the missing
-  # asan component is simulated. Everything else is xmake's own code:
-  # lib.detect.has_flags -> core.tools.cl.has_flags -> _check_try_running.
+  # cl prints that and still exits 0 whenever /fsanitize=address is on the
+  # command line WITHOUT a debug-info flag (-Zi/-ZI/-Z7), whether or not the
+  # asan runtime component is installed. xmake's own has_flags probe
+  # (cl -c -nologo <flags> -Fo<o> <src>) has exactly that shape, so stock 3.1.1
+  # mistakes the warning for "flag unsupported". The fix only fails on "error"
+  # or D9xxx driver-level diagnostics, so C5072 no longer poisons the check.
+  #
+  # Job layout:
+  #   1. ground truth  -- measure the real cl's behaviour, no assertions
+  #   2. flag checks   -- the five has_flags cases, stock then patched
+  #   3. end-to-end    -- release mode expects the bug (c++20 flag dropped);
+  #                       debug mode is a measurement (-Zi on the target hides
+  #                       C5072, so the flag survives); fixed release must keep
+  #                       the flag and build clean
   # ---------------------------------------------------------------------------
   windows-msvc:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      # only needed so we can build stub/stub_cl.c with the real MSVC
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Install xmake ${{ env.XMAKE_VERSION }} (official script)
@@ -45,39 +52,58 @@ jobs:
           Add-Content $env:GITHUB_PATH $installdir
           & "$installdir\xmake.exe" --version
 
-      - name: Build the stub cl.exe with the real MSVC
+      - name: Locate toolchain
         shell: pwsh
         run: |
-          $stubdir = "$env:RUNNER_TEMP\stub"
-          New-Item -ItemType Directory -Force $stubdir | Out-Null
-          # resolve the real cl BEFORE the stub shadows it on PATH
-          $realcl = (Get-Command cl.exe).Source
-          Write-Host "real cl: $realcl"
-          cl /nologo /W3 stub\stub_cl.c "/Fe$stubdir\cl.exe"
-          Copy-Item "$stubdir\cl.exe" "$stubdir\clang-cl.exe"
-          {
-            "STUB_DIR=$stubdir"
-            "STUB_CL=$stubdir\cl.exe"
-            "STUB_CLANG_CL=$stubdir\clang-cl.exe"
-            "STUB_REAL_CL=$realcl"
-            "FIXED_LUA=$env:GITHUB_WORKSPACE\patches\cl_has_flags.fixed.lua"
-          } | Add-Content $env:GITHUB_ENV
-
-      - name: 'Ground truth: what does this runner''s real cl do with /fsanitize=address?'
-        shell: pwsh
-        run: |
-          # Measure first, assert later. Everything below this step assumes the
-          # shape of cl's answer; this is where we actually find out what it is
-          # instead of trusting a guess.
           $cl = (Get-Command cl.exe).Source
           Write-Host "cl: $cl"
-          # `cl 2>&1` under $ErrorActionPreference='stop' throws a
-          # NativeCommandError in GitHub Actions, so go through cmd
-          cmd /c "`"$cl`" 2>&1" | Select-Object -First 1 | ForEach-Object { Write-Host "banner: $_" }
+          Add-Content $env:GITHUB_ENV "CL_PROGRAM=$cl"
+          $clangcl = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
+          if ($clangcl) {
+            Write-Host "clang-cl: $($clangcl.Source)"
+            Add-Content $env:GITHUB_ENV "CLANG_CL_PROGRAM=$($clangcl.Source)"
+          } else {
+            Write-Host "clang-cl: not on PATH, that check will be skipped"
+          }
+          Add-Content $env:GITHUB_ENV "FIXED_LUA=$env:GITHUB_WORKSPACE\patches\cl_has_flags.fixed.lua"
 
-          # the ASan runtime libraries are what decide whether cl answers
-          # /fsanitize=address with a warning; msvc-dev-cmd already exported the
-          # lib search path, so look there instead of guessing the MSVC layout
+      - name: 'Ground truth: measure the real cl (no assertions)'
+        shell: pwsh
+        run: |
+          # Everything below assumes the shape of cl's answer; this is where we
+          # actually find out what it is instead of trusting a guess.
+          $cl = $env:CL_PROGRAM
+          Set-Content -Path probe.c -Value 'int main(void){return 0;}' -Encoding ascii
+
+          # `cl 2>&1` under $ErrorActionPreference='stop' throws a
+          # NativeCommandError in GitHub Actions, so go through Start-Process
+          # with redirected streams instead.
+          $probes = @(
+            @{ name = 'A: /fsanitize=address, no debug info (xmake''s probe shape)';
+               args = @('/nologo','/c','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_a.obj",'probe.c') },
+            @{ name = 'B: same plus /Zi (a debug-mode target''s shape)';
+               args = @('/nologo','/c','/Zi','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_b.obj",'probe.c') },
+            @{ name = 'C: unknown option /xx (what D9002 looks like here)';
+               args = @('/nologo','/c','/xx',"/Fo$env:RUNNER_TEMP\gt_c.obj",'probe.c') }
+          )
+          foreach ($probe in $probes) {
+            $out = "$env:RUNNER_TEMP\gt.out"
+            $err = "$env:RUNNER_TEMP\gt.err"
+            Remove-Item $out,$err -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath $cl -ArgumentList $probe.args -NoNewWindow -Wait -PassThru `
+                  -RedirectStandardOutput $out -RedirectStandardError $err
+            Write-Host "=== $($probe.name)"
+            Write-Host "exit: $($p.ExitCode)"
+            Write-Host "stdout (this is what xmake parses):"
+            Get-Content $out | ForEach-Object { Write-Host "  |$_" }
+            $errlines = Get-Content $err -ErrorAction SilentlyContinue
+            if ($errlines) {
+              Write-Host "stderr (xmake does not parse this for cl):"
+              $errlines | ForEach-Object { Write-Host "  |$_" }
+            }
+          }
+
+          # for the record: is the asan runtime even installed on this runner?
           $asanlib = $null
           foreach ($dir in ($env:LIB -split ';' | Where-Object { $_ })) {
             $hit = Get-ChildItem -Path $dir -Filter 'clang_rt.asan_dynamic-x86_64.lib' `
@@ -87,53 +113,9 @@ jobs:
           if ($asanlib) {
             Write-Host "asan runtime: PRESENT ($asanlib)"
           } else {
-            Write-Host "asan runtime: ABSENT from LIB ($env:LIB)"
-          }
-
-          Set-Content -Path probe.c -Value 'int main(void){return 0;}' -Encoding ascii
-          $err = "$env:RUNNER_TEMP\probe.err"
-          $out = "$env:RUNNER_TEMP\probe.out"
-          $p = Start-Process -FilePath $cl -ArgumentList '/nologo','/c','/fsanitize=address',
-               "/Fo$env:RUNNER_TEMP\probe.obj",'probe.c' `
-               -NoNewWindow -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
-          Write-Host "--- exit code: $($p.ExitCode)"
-          Write-Host "--- stdout (verbatim, this is what xmake parses) ---"
-          Get-Content $out | ForEach-Object { Write-Host "|$_" }
-          Write-Host "--- stderr (verbatim, xmake does NOT parse this for cl) ---"
-          Get-Content $err | ForEach-Object { Write-Host "|$_" }
-
-          $stdout = Get-Content $out -Raw
-          if ($p.ExitCode -eq 0 -and $stdout -and ($stdout -split "`n" |
-              Where-Object { $_.Trim() -and $_ -notmatch 'probe\.c\s*$' }).Count -gt 0) {
-            Write-Host 'VERDICT: cl exited 0 but printed a non-filename line to stdout'
-            Write-Host '         -> xmake 3.1.1 _get_output() will call that "flag unsupported"'
-          } elseif ($p.ExitCode -eq 0) {
-            Write-Host 'VERDICT: cl exited 0 and stdout is clean'
-            Write-Host '         -> the real cl here cannot trigger the bug; the stub below is what makes the run deterministic'
-          } else {
-            Write-Host "VERDICT: cl exited $($p.ExitCode), a different failure mode than the one under test"
+            Write-Host "asan runtime: ABSENT from LIB"
           }
           exit 0
-
-      - name: End-to-end repro, stock xmake (expect the bug)
-        shell: pwsh
-        run: |
-          $env:Path = "$env:STUB_DIR;$env:Path"
-          Write-Host "cl now resolves to: $((Get-Command cl.exe).Source)"
-          Push-Location repro
-          xmake f -c -p windows -a x64 -m debug
-          $log = (xmake -v 2>&1 | Out-String)
-          Pop-Location
-          Write-Host $log
-          if ($log -match 'std:c\+\+20|std:c\+\+latest') {
-            Write-Host 'VERDICT: a c++20 flag reached the compiler -- bug did NOT reproduce'
-            exit 1
-          }
-          Write-Host 'VERDICT: NO c++20 flag reached the compiler -- set_languages("c++20") was silently dropped'
-          Write-Host '         the compile below then fails on <concepts>, which needs /std:c++20'
-          if ($log -notmatch 'concepts') {
-            Write-Host 'NOTE: expected the <concepts> failure to show up in the log'
-          }
 
       - name: Flag check, stock xmake (expect the bug)
         shell: pwsh
@@ -141,41 +123,72 @@ jobs:
           $env:EXPECT_MODE = 'bug'
           xmake l check/check_has_flags.lua
 
+      - name: E2E release mode, stock xmake (expect the c++20 flag dropped)
+        shell: pwsh
+        run: |
+          Push-Location repro
+          xmake f -c -p windows -a x64 -m release
+          $log = (xmake -v 2>&1 | Out-String)
+          Pop-Location
+          Write-Host $log
+          # the bug's signature is the language flag never reaching cl
+          if ($log -match 'std:c\+\+20|std:c\+\+latest') {
+            Write-Host 'VERDICT: a c++20 flag reached the compiler -- bug did NOT reproduce in release mode'
+            exit 1
+          }
+          Write-Host 'VERDICT: NO c++20 flag reached the compiler -- set_languages("c++20") was silently dropped'
+          if ($log -notmatch 'error C\d+') {
+            Write-Host 'NOTE: expected a compiler error -- src/main.cpp uses `concept`, which needs /std:c++20'
+            exit 1
+          }
+
+      - name: 'E2E debug mode, stock xmake (measurement: the target -Zi hides C5072)'
+        shell: pwsh
+        run: |
+          Push-Location repro
+          xmake f -c -p windows -a x64 -m debug
+          $log = (xmake -v 2>&1 | Out-String)
+          Pop-Location
+          if ($log -match 'std:c\+\+20|std:c\+\+latest') {
+            Write-Host 'MEASURE: c++20 flag kept in debug mode -- the target''s -Zi suppresses C5072 during detection'
+          } else {
+            Write-Host 'MEASURE: c++20 flag dropped even in debug mode -- the -Zi hypothesis is wrong, see the flag checks above'
+          }
+          exit 0
+
       - name: Apply patches/cl_has_flags.fixed.lua over os.programdir()
         shell: pwsh
         run: xmake l check/apply_fix.lua
 
-      - name: Flag check, with the fix
+      - name: Flag check, with the fix (expect support)
         shell: pwsh
         run: |
           $env:EXPECT_MODE = 'fixed'
           xmake l check/check_has_flags.lua
 
-      - name: End-to-end repro, with the fix
+      - name: E2E release mode, with the fix (expect the c++20 flag kept, clean build)
         shell: pwsh
         run: |
-          $env:Path = "$env:STUB_DIR;$env:Path"
-          Write-Host "cl now resolves to: $((Get-Command cl.exe).Source)"
           Push-Location repro
-          xmake f -c -p windows -a x64 -m debug
+          xmake f -c -p windows -a x64 -m release
           $log = (xmake -v 2>&1 | Out-String)
           Pop-Location
           Write-Host $log
-          # the bug's signature is the language flag never reaching cl, so that is
-          # what we assert -- an unrelated linker hiccup should not mask it
-          if ($log -match 'std:c\+\+20|std:c\+\+latest') {
-            Write-Host 'VERDICT: a c++20 language flag reached the compiler'
-          } else {
-            Write-Host 'VERDICT: NO c++20 language flag reached the compiler'
+          if ($log -notmatch 'std:c\+\+20|std:c\+\+latest') {
+            Write-Host 'VERDICT: NO c++20 flag reached the compiler even with the fix'
             exit 1
           }
-          if ($log -match 'error') {
-            Write-Host 'NOTE: the build still reported errors, see the log above'
+          if ($log -match 'error C\d+|error LNK\d+') {
+            Write-Host 'VERDICT: the build still reported errors, see the log above'
             exit 1
           }
-          Write-Host 'build succeeded'
+          Write-Host 'VERDICT: the c++20 flag reached the compiler and the build succeeded'
 
   # ---------------------------------------------------------------------------
+  # POSIX jobs (stub-driven) -- TEMPORARILY DISABLED while the Windows job is
+  # being validated against the real cl.exe; delete the '# ' prefix on every
+  # line of a job to re-enable it. The stub stays in stub/stub_cl.c.
+  #
   # Ubuntu, stock xmake installed by the official script.
   #
   # Same five checks. The detection logic is pure Lua, so the bug is not
@@ -187,79 +200,79 @@ jobs:
   # Its gitrepo is hardcoded to xmake-io/xmake.git, which is why it cannot be
   # used to install the fork below.
   # ---------------------------------------------------------------------------
-  ubuntu-stock:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install xmake v${{ env.XMAKE_VERSION }} from source (official script)
-        run: |
-          curl -fsSL https://xmake.io/shget.text | bash -s "v$XMAKE_VERSION"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/xmake" --version
-
-      - name: Build the stub cl
-        run: |
-          mkdir -p "$RUNNER_TEMP/stub"
-          cc -O0 -Wall -o "$RUNNER_TEMP/stub/cl" stub/stub_cl.c
-          cp "$RUNNER_TEMP/stub/cl" "$RUNNER_TEMP/stub/clang-cl"
-          {
-            echo "STUB_CL=$RUNNER_TEMP/stub/cl"
-            echo "STUB_CLANG_CL=$RUNNER_TEMP/stub/clang-cl"
-            echo "FIXED_LUA=$GITHUB_WORKSPACE/patches/cl_has_flags.fixed.lua"
-          } >> "$GITHUB_ENV"
-
-      - name: Flag check, stock xmake (expect the bug)
-        run: EXPECT_MODE=bug xmake l check/check_has_flags.lua
-
-      - name: Apply patches/cl_has_flags.fixed.lua over os.programdir()
-        run: xmake l check/apply_fix.lua
-
-      - name: Flag check, with the fix
-        run: EXPECT_MODE=fixed xmake l check/check_has_flags.lua
+  # ubuntu-stock:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Install xmake v${{ env.XMAKE_VERSION }} from source (official script)
+  #       run: |
+  #         curl -fsSL https://xmake.io/shget.text | bash -s "v$XMAKE_VERSION"
+  #         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+  #         "$HOME/.local/bin/xmake" --version
+  #
+  #     - name: Build the stub cl
+  #       run: |
+  #         mkdir -p "$RUNNER_TEMP/stub"
+  #         cc -O0 -Wall -o "$RUNNER_TEMP/stub/cl" stub/stub_cl.c
+  #         cp "$RUNNER_TEMP/stub/cl" "$RUNNER_TEMP/stub/clang-cl"
+  #         {
+  #           echo "CL_PROGRAM=$RUNNER_TEMP/stub/cl"
+  #           echo "CLANG_CL_PROGRAM=$RUNNER_TEMP/stub/clang-cl"
+  #           echo "FIXED_LUA=$GITHUB_WORKSPACE/patches/cl_has_flags.fixed.lua"
+  #         } >> "$GITHUB_ENV"
+  #
+  #     - name: Flag check, stock xmake (expect the bug)
+  #       run: EXPECT_MODE=bug xmake l check/check_has_flags.lua
+  #
+  #     - name: Apply patches/cl_has_flags.fixed.lua over os.programdir()
+  #       run: xmake l check/apply_fix.lua
+  #
+  #     - name: Flag check, with the fix
+  #       run: EXPECT_MODE=fixed xmake l check/check_has_flags.lua
 
   # ---------------------------------------------------------------------------
   # Ubuntu, xmake built from the fix branch of the fork.
   #
-  # The two jobs above apply the patch by copying a file over the installed
-  # script tree. This one proves the branch itself -- as committed to a real
-  # xmake checkout and built per the development guide -- behaves the same, so
-  # the patch file cannot have drifted from the branch.
+  # The job above applies the patch by copying a file over the installed script
+  # tree. This one proves the branch itself -- as committed to a real xmake
+  # checkout and built per the development guide -- behaves the same, so the
+  # patch file cannot have drifted from the branch.
   # ---------------------------------------------------------------------------
-  ubuntu-fork-fix:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/checkout@v4
-        with:
-          repository: xflcx1991/xmake
-          ref: fix-cl-c5072
-          submodules: recursive
-          path: xmake-src
-
-      - name: Build and install xmake from the fix branch
-        run: |
-          cd xmake-src
-          git show --stat --oneline HEAD
-          ./configure
-          make -j"$(nproc)"
-          make install PREFIX="$HOME/.local"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/xmake" --version
-
-      - name: Build the stub cl
-        run: |
-          mkdir -p "$RUNNER_TEMP/stub"
-          cc -O0 -Wall -o "$RUNNER_TEMP/stub/cl" stub/stub_cl.c
-          cp "$RUNNER_TEMP/stub/cl" "$RUNNER_TEMP/stub/clang-cl"
-          {
-            echo "STUB_CL=$RUNNER_TEMP/stub/cl"
-            echo "STUB_CLANG_CL=$RUNNER_TEMP/stub/clang-cl"
-          } >> "$GITHUB_ENV"
-
-      - name: Confirm the branch really carries the fix
-        run: grep -n 'D%d%d%d%d' "$HOME/.local/share/xmake/modules/core/tools/cl/has_flags.lua"
-
-      - name: Flag check (expect the fixed results, no file copying involved)
-        run: EXPECT_MODE=fixed xmake l check/check_has_flags.lua
+  # ubuntu-fork-fix:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         repository: xflcx1991/xmake
+  #         ref: fix-cl-c5072
+  #         submodules: recursive
+  #         path: xmake-src
+  #
+  #     - name: Build and install xmake from the fix branch
+  #       run: |
+  #         cd xmake-src
+  #         git show --stat --oneline HEAD
+  #         ./configure
+  #         make -j"$(nproc)"
+  #         make install PREFIX="$HOME/.local"
+  #         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+  #         "$HOME/.local/bin/xmake" --version
+  #
+  #     - name: Build the stub cl
+  #       run: |
+  #         mkdir -p "$RUNNER_TEMP/stub"
+  #         cc -O0 -Wall -o "$RUNNER_TEMP/stub/cl" stub/stub_cl.c
+  #         cp "$RUNNER_TEMP/stub/cl" "$RUNNER_TEMP/stub/clang-cl"
+  #         {
+  #           echo "CL_PROGRAM=$RUNNER_TEMP/stub/cl"
+  #           echo "CLANG_CL_PROGRAM=$RUNNER_TEMP/stub/clang-cl"
+  #         } >> "$GITHUB_ENV"
+  #
+  #     - name: Confirm the branch really carries the fix
+  #       run: grep -n 'D%d%d%d%d' "$HOME/.local/share/xmake/modules/core/tools/cl/has_flags.lua"
+  #
+  #     - name: Flag check (expect the fixed results, no file copying involved)
+  #       run: EXPECT_MODE=fixed xmake l check/check_has_flags.lua

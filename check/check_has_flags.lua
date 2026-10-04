@@ -1,26 +1,36 @@
 -- Drives xmake's REAL flag detection (lib.detect.has_flags ->
--- core.tools.cl.has_flags) against stub/stub_cl.c, which behaves like a cl.exe
--- running on a machine with no Address Sanitizer runtime component installed.
+-- core.tools.cl.has_flags) against a cl-shaped compiler and compares the result
+-- with what stock 3.1.1 vs. the patched module produce.
 --
--- Nothing here is mocked except the compiler: the detection code, the caching
--- and the output filtering are all xmake's own.
+-- Nothing here is mocked except the compiler choice: the detection code, the
+-- caching and the output filtering are all xmake's own.
 --
 -- `xmake l` does not forward arguments to the script, so everything is
 -- configured through the environment:
 --
---   STUB_CL        absolute path of the stub cl
---   STUB_CLANG_CL  absolute path of the stub clang-cl (same binary)
---   EXPECT_MODE    "bug"   -> assert the stock xmake 3.1.1 results
---                  "fixed" -> assert the results with patches/ applied
+--   CL_PROGRAM        path of the cl to check against:
+--                     - Windows CI: the runner's REAL cl.exe -- its probe line
+--                       (cl -c -nologo <flags> -Fo<o> <src>) has no debug-info
+--                       flag, so with /fsanitize=address on it cl prints
+--                       "warning C5072" and still exits 0. that is the bug's
+--                       raw material, no stub needed.
+--                     - POSIX runs:  the compiled stub/stub_cl.c
+--   CLANG_CL_PROGRAM  path of a clang-cl for the unaffected-baseline case
+--                     (optional; the case is skipped when absent)
+--   EXPECT_MODE       "bug"   -> assert the stock xmake 3.1.1 results
+--                     "fixed" -> assert the results with patches/ applied
+--   REPORT_ONLY       when set, print what has_flags returns but never fail
+--                     (used by the Windows ground-truth steps)
 
 import("lib.detect.has_flags")
 
-local stub_cl = os.getenv("STUB_CL")
-local stub_clang_cl = os.getenv("STUB_CLANG_CL")
+local cl_program = os.getenv("CL_PROGRAM")
+local clang_cl_program = os.getenv("CLANG_CL_PROGRAM")
 local mode = os.getenv("EXPECT_MODE") or "bug"
+local report_only = os.getenv("REPORT_ONLY") ~= nil
 
-if not stub_cl or not stub_clang_cl then
-    os.raise("STUB_CL and STUB_CLANG_CL must point at the compiled stub")
+if not cl_program then
+    os.raise("CL_PROGRAM must point at the cl to check against (real cl.exe or the stub)")
 end
 if mode ~= "bug" and mode ~= "fixed" then
     os.raise("EXPECT_MODE must be 'bug' or 'fixed', got '%s'", mode)
@@ -31,27 +41,27 @@ local asan = {"-fsanitize=address"}
 -- expected[i] = {bug = <stock 3.1.1>, fixed = <with the patch>}
 local cases = {
     {
-        tool = "cl", program = stub_cl, flags = {"-fsanitize=address"},
+        tool = "cl", flags = {"-fsanitize=address"},
         expected = {bug = false, fixed = true},
-        why = "cl does support /fsanitize; C5072 only says the runtime component is missing",
+        why = "cl supports /fsanitize; C5072 only says the probe line has no debug info (-Zi)",
     },
     {
-        tool = "clang-cl", program = stub_clang_cl, flags = {"-fsanitize=address"},
+        tool = "clang-cl", flags = {"-fsanitize=address"}, use_clang_cl = true,
         expected = {bug = true, fixed = true},
         why = "core/tools/clang_cl/has_flags.lua only looks at the exit code, so it was never affected",
     },
     {
-        tool = "cl", program = stub_cl, flags = {"-std:c++17"}, sysflags = asan,
+        tool = "cl", flags = {"-std:c++17"}, sysflags = asan,
         expected = {bug = false, fixed = true},
         why = "this is the one that breaks real builds: set_languages() probes leak the asan sysflag",
     },
     {
-        tool = "cl", program = stub_cl, flags = {"-FS"}, sysflags = asan,
+        tool = "cl", flags = {"-FS"}, sysflags = asan,
         expected = {bug = true, fixed = true},
         why = "-FS is hardcoded in core/tools/cl/check_knownargs.lua, so it never reaches the probe",
     },
     {
-        tool = "cl", program = stub_cl, flags = {"-xx"},
+        tool = "cl", flags = {"-xx"},
         expected = {bug = false, fixed = false},
         why = "genuinely unknown option: D9002 must still be reported, the fix may not swallow it",
     },
@@ -59,16 +69,18 @@ local cases = {
 
 print("")
 print(string.format("xmake %s, programdir %s", xmake.version(), os.programdir()))
-print(string.format("stub cl: %s", stub_cl))
-print(string.format("expecting the '%s' results", mode))
+print(string.format("cl:        %s", cl_program))
+print(string.format("clang-cl:  %s", clang_cl_program or "(not set, that case will be skipped)"))
+print(string.format("expecting the '%s' results%s", mode, report_only and " (report only, no assertions)" or ""))
 print("")
 
 local failed = 0
-for _, c in ipairs(cases) do
-    local want = c.expected[mode]
+
+local function run_case(c, program)
+    local want = report_only and nil or c.expected[mode]
     local errors = nil
     local opt = {
-        program = c.program,
+        program = program,
         toolkind = "cc",
         flagkind = "cxflags",   -- what core/tools/cl.lua nf_language() passes
         force = true,     -- never trust a cached result across the two modes
@@ -86,20 +98,34 @@ for _, c in ipairs(cases) do
     local got = has_flags(c.tool, c.flags, opt)
     got = got and true or false
 
-    local ok = (got == want)
-    if not ok then
-        failed = failed + 1
+    local ok
+    if report_only then
+        ok = true
+    else
+        ok = (got == want)
+        if not ok then
+            failed = failed + 1
+        end
     end
     print(string.format("  [%s] %-9s %-22s sysflags=%-20s -> %-5s (want %s)",
-        ok and "PASS" or "FAIL",
+        report_only and "REPORT" or (ok and "PASS" or "FAIL"),
         c.tool,
         table.concat(c.flags, " "),
         c.sysflags and table.concat(c.sysflags, " ") or "-",
         tostring(got),
         tostring(want)))
     print(string.format("         why: %s", c.why))
-    if not ok and errors then
+    if errors then
         print(string.format("         reported: %s", tostring(errors):trim():gsub("\n", "\n                     ")))
+    end
+end
+
+for _, c in ipairs(cases) do
+    local program = c.use_clang_cl and clang_cl_program or cl_program
+    if not os.isfile(program) then
+        print(string.format("  [SKIP] %-9s %-22s (%s not found)", c.tool, table.concat(c.flags, " "), c.tool))
+    else
+        run_case(c, program)
     end
 end
 
@@ -107,4 +133,8 @@ print("")
 if failed > 0 then
     os.raise("%d of %d checks did not match the '%s' expectations", failed, #cases, mode)
 end
-print(string.format("all %d checks match the '%s' expectations", #cases, mode))
+if report_only then
+    print("report only -- no assertions were made")
+else
+    print(string.format("all %d checks match the '%s' expectations", #cases, mode))
+end

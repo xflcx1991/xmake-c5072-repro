@@ -61,13 +61,18 @@ end
 --
 -- and we should only fail on driver-level option diagnostics (Command line warning
 -- D9xxx, e.g. D9002 for unknown options) and errors, because frontend warnings such
--- as C5072 (Address Sanitizer is not installed) are emitted even for fully supported
--- flags, e.g. -fsanitize=address when the asan runtime component is missing.
+-- as C5072 are benign and still exit 0: cl prints
+--   <src> : warning C5072: ASAN enabled without debug information emission. Enable
+--           debug info for better ASAN error reporting
+-- whenever -fsanitize=address is given without a debug-info flag (-Zi/-ZI/-Z7),
+-- whether or not the asan runtime component is installed. the has_flags probe line
+-- itself carries no debug info, so once the asan flag leaks into sysflags every
+-- probe answers with this warning.
 --
 -- e.g.
 --   cl_has_flags_xxx.c                                              <-- the filename echo, skip it
 --   cl : Command line warning D9002 : ignoring unknown option '-xx' <-- a real diagnostic
---   cl : Command line warning C5072 : Address Sanitizer is not installed ... <-- benign, skip it
+--   ... : warning C5072: ASAN enabled without debug information emission ... <-- benign, skip it
 --
 function _get_output(outdata, sourcefile)
     local filename = path.filename(sourcefile)

@@ -3,7 +3,7 @@
 // xmake decides whether a flag is supported by READING CL'S STDOUT, not by
 // looking at the exit code -- cl exits 0 even for an unknown option. This stub
 // reproduces exactly the three invocations xmake's detection makes, so the
-// logic can be exercised on any platform, with or without MSVC installed, and
+// logic can be exercised on Linux/macOS, with or without MSVC installed, and
 // with a deterministic result:
 //
 //   cl                                  -> banner, exit 0
@@ -11,31 +11,41 @@
 //   cl -c -nologo <flags> -Fo<o> <src>  -> basename(src), then one diagnostic
 //                                          per flag, exit 0
 //
-// The diagnostics mirror real cl:
+// The diagnostics mirror real cl, measured on GitHub windows-latest
+// (MSVC 19.51.36260, VCToolsVersion 14.51.36231, ASan runtime installed):
 //
-//   option cl does not know       -> "Command line warning D9002" (driver level)
-//   /fsanitize without the asan   -> "Command line warning C5072" (frontend)
-//   runtime component installed
+//   unknown option                  -> "cl : Command line warning D9002 :
+//                                      ignoring unknown option '<opt>'"
+//                                      (driver level)
+//   /fsanitize=address with no      -> "<src> : warning C5072: ASAN enabled
+//   debug-info flag (-Zi/-ZI/-Z7)      without debug information emission.
+//                                      Enable debug info for better ASAN error
+//                                      reporting" (frontend level)
 //
 // Both are warnings and both exit 0. C5072 is the one xmake 3.1.1 mistakes for
 // a real failure: _get_output() in modules/core/tools/cl/has_flags.lua treats
 // every stdout line that is not the filename echo as an unsupported flag.
 //
+// Two facts measured on the real compiler and baked into this stub:
+//
+//   1. C5072 fires even when the ASan runtime IS installed. It is emitted
+//      because the probe line (cl -c -nologo <flags> -Fo<o> src.c) carries no
+//      debug-info flag. xmake's own probe has exactly this shape, so the bug
+//      reproduces on a stock GitHub runner. (An earlier version of this stub
+//      used the assumed wording "Address Sanitizer is not installed"; that was
+//      a misreading of the warning and has been corrected.)
+//
+//   2. Adding -Zi/-ZI/-Z7 to the same command line silences C5072. That is why
+//      xmake's `xmake f -m debug` (which puts -Zi on the target) does not trip
+//      the bug, while release mode does.
+//
 // On Windows xmake spawns cl through private/tools/vstool.lua, which sets
 // VS_UNICODE_OUTPUT=<fd of the capture file> and decodes that file as UTF-16LE.
 // So when that variable is present we must emit UTF-16LE, otherwise xmake reads
-// garbage and every check fails for the wrong reason.
-//
-// Two modes:
-//
-//   STUB_REAL_CL unset  -> fully synthetic. Enough for check/check_has_flags.lua,
-//                          runs anywhere, no MSVC required.
-//   STUB_REAL_CL set    -> passthrough. Injects the C5072 warning, then hands the
-//                          unchanged argv to the real cl.exe and returns its exit
-//                          code. This is what makes the end-to-end build in
-//                          repro/ reproduce deterministically on a CI runner whose
-//                          MSVC *does* ship the asan component (GitHub's does, so
-//                          the real cl would stay silent and hide the bug).
+// garbage and every check fails for the wrong reason. (The stub is written for
+// POSIX CI, where vstool is not used and plain text is emitted.)
+
+#define _CRT_SECURE_NO_WARNINGS
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,10 +54,6 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
-#include <process.h>
-#else
-#include <unistd.h>
-#include <sys/wait.h>
 #endif
 
 static int g_unicode = 0;
@@ -114,13 +120,26 @@ static int starts_with(const char *s, const char *prefix)
     return strncmp(s, prefix, strlen(prefix)) == 0;
 }
 
+// normalise a cl option to '-' form so '/' and '-' spellings compare equal
+static const char *as_dash(const char *arg, char *buf, size_t bufsize)
+{
+    if (arg[0] == '/')
+    {
+        buf[0] = '-';
+        strncpy(buf + 1, arg + 1, bufsize - 2);
+        buf[bufsize - 1] = '\0';
+        return buf;
+    }
+    return arg;
+}
+
 // options this stub pretends to understand; anything else is "unknown" and
 // earns a D9002, exactly like the real driver
 static int is_known(const char *arg)
 {
     static const char *const exact[] = {
         "-c", "-nologo", "-FS", "-utf-8", "-permissive-", "-bigobj",
-        "-EHsc", "-GR", "-GR-", "-Zi", "-Z7", "-Od", "-O1", "-O2", "-Ox",
+        "-EHsc", "-GR", "-GR-", "-Zi", "-ZI", "-Z7", "-Od", "-O1", "-O2", "-Ox",
         "-MD", "-MDd", "-MT", "-MTd", "-LD", "-LDd",
         "-W0", "-W1", "-W2", "-W3", "-W4", "-Wall", "-WX", "-TP", "-TC",
         "-Gm-", "-MP", "-FC", "-showIncludes",
@@ -130,22 +149,13 @@ static int is_known(const char *arg)
         "-Fo", "-Fe", "-Fd", "-Fp", "-Fa", "-FR", "-FI", "-I", "-D", "-U",
         "-std:", "-source-charset:", "-execution-charset:", "-external:I",
         "-external:W", "-Zc:", "-Yc", "-Yu", "-wd", "-we", "-wo",
-        "-fsanitize=",   // a real option; whether it WORKS depends on the asan
-                        // runtime component, which is what C5072 reports
-        "-fsanitize:",
+        "-fsanitize=",   // a real option; whether it WORKS without warnings
+        "-fsanitize:",   // depends on debug info, which is what C5072 reports
         NULL
     };
     char buf[256];
-    const char *a = arg;
+    const char *a = as_dash(arg, buf, sizeof(buf));
     int i;
-
-    if (*a == '/')
-    {
-        buf[0] = '-';
-        strncpy(buf + 1, a + 1, sizeof(buf) - 2);
-        buf[sizeof(buf) - 1] = '\0';
-        a = buf;
-    }
 
     for (i = 0; exact[i]; ++i)
         if (strcmp(a, exact[i]) == 0) return 1;
@@ -159,6 +169,20 @@ static int is_asan(const char *arg)
     if (arg[0] != '-' && arg[0] != '/') return 0;
     return starts_with(arg + 1, "fsanitize=address") ||
            starts_with(arg + 1, "fsanitize:address");
+}
+
+// C5072 is only emitted when the command line has no debug-info flag
+static int has_debuginfo(int argc, char **argv)
+{
+    int i;
+    for (i = 1; i < argc; ++i)
+    {
+        char buf[256];
+        const char *a = as_dash(argv[i], buf, sizeof(buf));
+        if (strcmp(a, "-Zi") == 0 || strcmp(a, "-ZI") == 0 || strcmp(a, "-Z7") == 0)
+            return 1;
+    }
+    return 0;
 }
 
 // Source files cannot be recognised by "does not start with - or /": on POSIX a
@@ -201,48 +225,11 @@ static const char *basename_of(const char *p)
     return base;
 }
 
-// run the real cl with this stub's own argv (argv[0] replaced by the real path)
-static int passthrough(const char *real, int argc, char **argv)
-{
-    char **child_argv = malloc(sizeof(char *) * (argc + 1));
-    int i, code;
-
-    if (!child_argv) return 1;
-    child_argv[0] = (char *)real;
-    for (i = 1; i < argc; ++i) child_argv[i] = argv[i];
-    child_argv[argc] = NULL;
-
-    fflush(stdout);
-#ifdef _WIN32
-    code = _spawnv(_P_WAIT, real, (const char *const *)child_argv);
-    if (code == -1)
-    {
-        fprintf(stderr, "stub_cl: cannot spawn %s\n", real);
-        code = 1;
-    }
-#else
-    {
-        pid_t pid = fork();
-        int status = 0;
-        if (pid == 0)
-        {
-            execv(real, child_argv);
-            _exit(127);
-        }
-        waitpid(pid, &status, 0);
-        code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-    }
-#endif
-    free(child_argv);
-    return code;
-}
-
 int main(int argc, char **argv)
 {
     int i;
     const char *src;
-    const char *real_cl = getenv("STUB_REAL_CL");
-    char line[512];
+    char line[1024];
 
 #ifdef _WIN32
     _setmode(_fileno(stdout), _O_BINARY);
@@ -267,22 +254,6 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (real_cl && *real_cl)
-    {
-        // Passthrough: pretend the asan runtime component is missing, then let
-        // the real compiler do the actual work and decide the exit code.
-        for (i = 1; i < argc; ++i)
-        {
-            if (is_asan(argv[i]))
-            {
-                emit("cl : Command line warning C5072 : Address Sanitizer is not "
-                     "installed. This configuration is unsupported.");
-                break;
-            }
-        }
-        return passthrough(real_cl, argc, argv);
-    }
-
     // a compile invocation: cl echoes the source file name first, even when it
     // succeeds, because -nologo only suppresses the banner
     src = find_source(argc, argv);
@@ -294,10 +265,17 @@ int main(int argc, char **argv)
         if (is_source(argv[i])) continue;   // POSIX absolute path, not an option
         if (is_asan(argv[i]))
         {
-            // the machine has no Address Sanitizer runtime component, so cl
-            // warns -- but still compiles, and still exits 0
-            emit("cl : Command line warning C5072 : Address Sanitizer is not "
-                 "installed. This configuration is unsupported.");
+            // no debug info on the probe line: cl warns about ASAN reporting
+            // quality -- but still compiles, and still exits 0
+            if (!has_debuginfo(argc, argv))
+            {
+                snprintf(line, sizeof(line),
+                         "%s : warning C5072: ASAN enabled without debug "
+                         "information emission. Enable debug info for better "
+                         "ASAN error reporting",
+                         src ? src : "<unknown>");
+                emit(line);
+            }
         }
         else if (!is_known(argv[i]))
         {
