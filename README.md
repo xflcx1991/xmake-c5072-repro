@@ -1,7 +1,9 @@
 # xmake 3.1.1: C5072 breaks MSVC flag detection
 
-A minimal, self-contained reproduction of an xmake 3.1.1 regression, plus the
-one-file fix and a CI setup that proves both halves on a real Windows runner.
+A minimal reproduction of an xmake 3.1.1 regression, the one-file fix, and a
+CI setup that proves both halves against a real Windows runner — by driving
+xmake's own flag detection into the runner's real `cl.exe` and asserting what
+it answers. Nothing is stubbed or mocked.
 
 ## The bug
 
@@ -65,22 +67,26 @@ warning as an answer to a different question".
 local checkflags = table.join(flags, opt.sysflags)
 ```
 
-Once `-fsanitize=address` is in the target's flags — which is exactly what a
-package's `configs = {asan = true}`, or `set_policy("build.sanitizer.address", true)`,
-does (see `private/utils/toolchain.lua:get_sanitizer_flags`, which adds it
-unconditionally for cl, with no capability check) — it leaks into **every
-subsequent probe** as a sysflag.
+So once `-fsanitize=address` rides along as a **sysflag** — which is exactly
+what package installs and `on_check` flows do, passing the toolchain's flags
+into every subsequent capability probe — each probe is answered with C5072
+and judged "unsupported".
 
-`set_languages("c++20")` then probes `/std:c++20` and `/std:c++latest`, each one
-accompanied by `-fsanitize=address`, each one answered with the same warning,
-each one judged unsupported. `nf_language()` in `core/tools/cl.lua` runs out of
-candidates and **returns nil**. The language flag is silently dropped, the
-source is compiled in MSVC's default C++14 mode, and a C++20 project fails to
-build with errors that point nowhere near the real cause.
+`set_languages("c++20")` then probes `/std:c++20` and `/std:c++latest`, each
+one accompanied by `-fsanitize=address`, each one answered with the same
+warning, each one judged unsupported. `nf_language()` in `core/tools/cl.lua`
+runs out of candidates and **returns nil**. The language flag is silently
+dropped, the source is compiled in MSVC's default C++14 mode, and a C++20
+project fails to build with errors that point nowhere near the real cause.
+Check case 3 in `check/check_has_flags.lua` reproduces exactly this shape
+(flag under test + asan sysflag) against the real cl.
 
-Corollary, verified by the CI job: a **debug-mode** build (`xmake f -m debug`)
-does not reproduce — the target's own `-Zi` suppresses C5072. **Release mode
-does**, because nothing puts a debug-info flag on the probe line.
+A measured caveat: a *plain* project build (`set_policy("build.sanitizer.address", true)`
++ `set_languages("c++20")`, no packages) does **not** reproduce — the CI job
+records that the `set_languages` probe in that flow carries no asan sysflag,
+so C5072 never fires and the language flag survives in both release and debug
+mode. The breakage needs the sysflag leak, which is why the five flag checks —
+not the plain E2E build — are the proof.
 
 Regression window: introduced with the stdout-filtering change for
 [xmake-io/xmake#7610](https://github.com/xmake-io/xmake/issues/7610),
@@ -91,13 +97,20 @@ present in 3.1.1.
 The `windows-msvc` job's ground-truth step runs the runner's **real** cl.exe
 with three probe shapes and prints stdout, stderr and exit code for each:
 
-* A: `/fsanitize=address`, no debug info — xmake's probe shape. Expected: C5072
+* A: `/fsanitize=address`, no debug info — xmake's probe shape. Measured: C5072
   on stdout, exit `0`.
-* B: same plus `/Zi` — a debug-mode target's shape. Expected: clean stdout.
-* C: unknown option `/xx`. Expected: D9002 on stdout, exit `0`.
+* B: same plus `/Zi` — a debug-mode target's shape. Measured: clean stdout.
+* C: unknown option `/xx`. Measured: D9002, exit `0` — on **stderr** when cl
+  runs directly; through xmake's `vstool` wrapper (`VS_UNICODE_OUTPUT`) the
+  diagnostics land in the captured output xmake parses, which is why check
+  case 5 still correctly answers "unsupported" with the real cl.
 
 It also records whether `clang_rt.asan_dynamic-x86_64.lib` is present in the
 MSVC lib path — on GitHub runners it is, and C5072 fires anyway.
+
+The stock-xmake E2E step is likewise a measurement, not an assertion: it
+builds `repro/` in release and debug mode and records whether the c++20 flag
+reaches the compiler (see the caveat above).
 
 ## The fix
 
@@ -114,60 +127,33 @@ diff against an xmake checkout.
 ## Layout
 
 ```
-stub/stub_cl.c              a synthetic stand-in for cl.exe (used by the POSIX
-                            jobs, which are commented out for now)
 check/check_has_flags.lua   drives xmake's REAL detection against CL_PROGRAM
-                            (the real cl.exe on Windows, the stub on POSIX),
-                            5 cases, asserts either the buggy or the fixed
-                            results; REPORT_ONLY=1 prints without asserting
+                            (the real cl.exe on the Windows runner), 5 cases,
+                            asserts either the buggy or the fixed results;
+                            REPORT_ONLY=1 prints without asserting
 check/apply_fix.lua         copies patches/cl_has_flags.fixed.lua over the
                             installed xmake's own module tree
+check/import_module.lua     smoke test that the patched module still parses,
+                            loads and really carries the filter (used by the
+                            POSIX jobs, which never invoke cl)
 patches/                    the fix, as a full file and as a diff
-repro/                      an actual xmake project whose build breaks on stock
-                            3.1.1 (release mode) and succeeds with the fix
-.github/workflows/ci.yml    windows-msvc (against the real cl.exe); the two
-                            ubuntu jobs are commented out for now
+repro/                      an actual xmake project (c++20 + asan policy) used
+                            for the E2E measurements and the control builds
+.github/workflows/ci.yml    windows-msvc, ubuntu-stock, ubuntu-fork-fix,
+                            macos-arm64
 ```
-
-Nothing is mocked except the compiler. The detection code, the caching and the
-output filtering are all xmake's own.
-
-### The stub
-
-`stub_cl.c` reproduces the three invocations xmake's detection makes:
-
-```
-cl                                  -> banner, exit 0        (find_cl.lua probe)
-cl -?                               -> option list, exit 0   (_check_from_arglist)
-cl -c -nologo <flags> -Fo<o> <src>  -> basename(src), then one diagnostic per
-                                       flag, exit 0          (_check_try_running)
-```
-
-The diagnostics mirror the measured real-cl behaviour:
-
-* unknown option → `cl : Command line warning D9002 : ignoring unknown option '<opt>'`
-* `/fsanitize=address` with no debug-info flag on the line →
-  `<src> : warning C5072: ASAN enabled without debug information emission. Enable debug info for better ASAN error reporting`
-
-Two details that are easy to get wrong and are handled here:
-
-* On Windows, xmake spawns cl through `private/tools/vstool.lua`, which sets
-  `VS_UNICODE_OUTPUT` and decodes the captured stdout as **UTF-16LE**. When that
-  variable is present the stub emits UTF-16LE too, otherwise xmake reads garbage
-  and every check fails for the wrong reason. (The POSIX jobs run the stub
-  directly, in plain text.)
-* cl echoes the source filename to stdout even on success (`-nologo` only
-  suppresses the banner). `_get_output()` skips lines ending with that filename,
-  so the stub must emit it or the filter has nothing to filter.
 
 ## The five checks
+
+Run on the Windows runner against the **real** cl.exe, through xmake's own
+`lib.detect.has_flags` → `core.tools.cl.has_flags` path:
 
 | # | tool | flags | sysflags | stock 3.1.1 | fixed | why |
 |---|---|---|---|---|---|---|
 | 1 | `cl` | `-fsanitize=address` | — | `false` | `true` | cl does support `/fsanitize`; C5072 only says the probe line has no debug info |
 | 2 | `clang-cl` | `-fsanitize=address` | — | `true` | `true` | `core/tools/clang_cl/has_flags.lua` only looks at the exit code, so it was never affected (skipped if clang-cl is absent) |
-| 3 | `cl` | `-std:c++17` | `-fsanitize=address` | `false` | `true` | **the one that breaks real builds** — `set_languages()` probes leak the asan sysflag |
-| 4 | `cl` | `-FS` | `-fsanitize=address` | `true` | `true` | `-FS` is hardcoded in `core/tools/cl/check_knownargs.lua`, so it never reaches a probe |
+| 3 | `cl` | `-std:c++17` | `-fsanitize=address` | `false` | `true` | **the one that breaks real builds** — the sysflag shape package/on_check flows produce |
+| 4 | `cl` | `-FS` | `-fsanitize=address` | `true` | `true` | `-FS` is hardcoded in `core/tools/cl/check_knownargs.lua`, so it never reaches the probe |
 | 5 | `cl` | `-xx` | — | `false` | `false` | genuinely unknown option: D9002 must still be reported, the fix may not swallow it |
 
 Case 5 is the guard against an over-broad fix.
@@ -178,29 +164,27 @@ Case 5 is the guard against an over-broad fix.
 does **not** accept inline code — everything is configured through environment
 variables.
 
-Linux or macOS, no MSVC required:
+On a Windows machine with Visual Studio and a stock xmake 3.1.1:
 
-```sh
-mkdir -p /tmp/stub
-cc -O0 -Wall -o /tmp/stub/cl stub/stub_cl.c
-cp /tmp/stub/cl /tmp/stub/clang-cl
+```pwsh
+$env:CL_PROGRAM = (Get-Command cl.exe).Source
+$env:CLANG_CL_PROGRAM = (Get-Command clang-cl.exe).Source   # optional
 
-export CL_PROGRAM=/tmp/stub/cl
-export CLANG_CL_PROGRAM=/tmp/stub/clang-cl
-
-# against a stock 3.1.1 install: asserts the buggy results
-EXPECT_MODE=bug xmake l check/check_has_flags.lua
+# asserts the buggy results
+$env:EXPECT_MODE = 'bug'
+xmake l check/check_has_flags.lua
 
 # overwrite the installed module with the fix (keeps a .orig backup)
-FIXED_LUA=$PWD/patches/cl_has_flags.fixed.lua xmake l check/apply_fix.lua
+$env:FIXED_LUA = "$PWD\patches\cl_has_flags.fixed.lua"
+xmake l check/apply_fix.lua
 
 # now asserts the fixed results
-EXPECT_MODE=fixed xmake l check/check_has_flags.lua
+$env:EXPECT_MODE = 'fixed'
+xmake l check/check_has_flags.lua
 ```
 
-On a Windows machine with Visual Studio installed you can point
-`CL_PROGRAM` at the real `cl.exe` — its probe shape alone triggers C5072, no
-stub needed (that is exactly what the CI job does).
+The probe shape alone triggers C5072 — no stub is involved anywhere; the same
+cl.exe GitHub's runners ship is enough.
 
 Or apply the diff to a source checkout instead:
 
@@ -214,32 +198,45 @@ does not exist, so a wrong `programdir` fails loudly instead of silently testing
 the stock module. Single-file `xmake-bundle-*` builds unpack their modules to a
 tmpdir and `os.programdir()` points there, so it works for those too.
 
+On Linux/macOS the same project builds cleanly through gcc/AppleClang (that is
+the control build in the POSIX jobs), and `check/import_module.lua` verifies
+the patched module loads there:
+
+```sh
+FIXED_LUA=$PWD/patches/cl_has_flags.fixed.lua xmake l check/apply_fix.lua
+xmake l check/import_module.lua
+```
+
 The end-to-end project:
 
 ```sh
 cd repro
-xmake f -c -p windows -a x64 -m release   # release: stock 3.1.1 drops /std:c++20
-xmake -v                                  # look for /std:c++20 in the cl command line
+xmake f -c -p windows -a x64 -m release
+xmake -v          # watch for /std:c++20 in the cl command line
 ```
-
-(`-m debug` builds keep the flag even on stock 3.1.1 — the target's `-Zi`
-hides C5072 — which is exactly why this bug is easy to miss locally.)
 
 Note that `xmake f -c` is required when switching xmake versions: the detect
 cache key does not include the version, so a stale result survives otherwise.
 
 ## CI
 
+Four jobs, all using the official install scripts:
+
 * **windows-msvc** — `psget.text -version 3.1.1 -installdir ...`, then, against
   the runner's **real** cl.exe (no stub, no PATH tricks — xmake resolves cl via
   the cached VS environment to an absolute path, so shadowing cannot work):
-  ground-truth probes, the five flag checks in both modes, and the end-to-end
-  repro in release mode (stock: expects the c++20 flag dropped; fixed: expects
-  it kept and a clean build), plus a debug-mode measurement showing the target
-  `-Zi` masking the bug.
-* **ubuntu-stock** / **ubuntu-fork-fix** — currently commented out in
-  `ci.yml`; they drive the same checks through the synthetic stub on POSIX.
-  Delete the `# ` prefixes to re-enable.
+  ground-truth probes, the five flag checks in both modes, the E2E
+  measurements, and — with the fix applied — the five checks again plus a
+  release build asserting the c++20 flag is kept and the build is clean.
+* **ubuntu-stock** — `shget.text | bash -s v3.1.1`. Control build through gcc
+  (the project itself is healthy: both `-std=c++` and `-fsanitize=address`
+  reach the compiler), then `apply_fix` + import smoke + rebuild, proving the
+  patched module is loadable and normal builds are unaffected on POSIX.
+* **ubuntu-fork-fix** — builds `xflcx1991/xmake@fix-cl-c5072` from source per
+  the development guide (`./configure && make && make install PREFIX=`), so
+  the branch and the patch file cannot drift apart.
+* **macos-arm64** — same control build + fix safety as ubuntu-stock, on
+  AppleClang, arm64 hardware.
 
 Two gotchas worth knowing:
 

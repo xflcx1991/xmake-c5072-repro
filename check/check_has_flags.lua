@@ -8,13 +8,12 @@
 -- `xmake l` does not forward arguments to the script, so everything is
 -- configured through the environment:
 --
---   CL_PROGRAM        path of the cl to check against:
---                     - Windows CI: the runner's REAL cl.exe -- its probe line
---                       (cl -c -nologo <flags> -Fo<o> <src>) has no debug-info
---                       flag, so with /fsanitize=address on it cl prints
---                       "warning C5072" and still exits 0. that is the bug's
---                       raw material, no stub needed.
---                     - POSIX runs:  the compiled stub/stub_cl.c
+--   CL_PROGRAM        path of the cl to check against. on Windows CI this is
+--                     the runner's REAL cl.exe -- its probe line
+--                     (cl -c -nologo <flags> -Fo<o> <src>) has no debug-info
+--                     flag, so with /fsanitize=address on it cl prints
+--                     "warning C5072" and still exits 0. that is the bug's
+--                     raw material, no stub needed.
 --   CLANG_CL_PROGRAM  path of a clang-cl for the unaffected-baseline case
 --                     (optional; the case is skipped when absent)
 --   EXPECT_MODE       "bug"   -> assert the stock xmake 3.1.1 results
@@ -30,7 +29,7 @@ local mode = os.getenv("EXPECT_MODE") or "bug"
 local report_only = os.getenv("REPORT_ONLY") ~= nil
 
 if not cl_program then
-    os.raise("CL_PROGRAM must point at the cl to check against (real cl.exe or the stub)")
+    os.raise("CL_PROGRAM must point at the cl to check against")
 end
 if mode ~= "bug" and mode ~= "fixed" then
     os.raise("EXPECT_MODE must be 'bug' or 'fixed', got '%s'", mode)
@@ -53,7 +52,9 @@ local cases = {
     {
         tool = "cl", flags = {"-std:c++17"}, sysflags = asan,
         expected = {bug = false, fixed = true},
-        why = "this is the one that breaks real builds: set_languages() probes leak the asan sysflag",
+        why = "the one that breaks real builds: package on_check flows pass the "
+            .. "toolchain flags as sysflags, and every probe after the asan flag "
+            .. "leaks in is answered with C5072",
     },
     {
         tool = "cl", flags = {"-FS"}, sysflags = asan,
