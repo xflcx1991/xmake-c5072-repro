@@ -145,7 +145,32 @@ jobs:
             @{ name = 'G: /options:strict + /fsanitize=address (must still exit 0, C5072 stays a warning)';
                args = @('/nologo','/c','/options:strict','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_g.obj",'probe.c') },
             @{ name = 'H: /options:strict + /W4 /W3 (accepted-but-overridden: D9025 under strict?)';
-               args = @('/nologo','/c','/options:strict','/W4','/W3',"/Fo$env:RUNNER_TEMP\gt_h.obj",'probe.c') }
+               args = @('/nologo','/c','/options:strict','/W4','/W3',"/Fo$env:RUNNER_TEMP\gt_h.obj",'probe.c') },
+            # D/E showed strict only reaches unrecognized OPTIONS, so /W5 stays
+            # exit 0 + D9014 either way. "Invalid value" is its own family with its
+            # own codes (D9014, D9025, D9041, D8021) and per the design decision
+            # those count as SUPPORTED: cl carried on and produced an object file.
+            #
+            # I is the shape of the one-time capability probe a fix needs, because
+            # /options:strict is VS 2022 17.0+ only and cl/has_flags.lua is inherited
+            # by icl and ifort, where its behavior is undocumented: on a driver that
+            # does not know it, the flag must be dropped rather than left in the
+            # probe line. Whether such a driver warns (exit 0) or errors (exit != 0)
+            # on an unrecognized option is the difference between a harmless
+            # addition and one that answers "unsupported" for every flag there is.
+            #
+            # J is the leak's own shape: -fsanitize=address is what arrives in
+            # sysflags, and C5072 is the answer that has to be read as "supported".
+            # K asks whether the edition-lacks-the-feature family (D9040, "ignoring
+            # '/analyze'") is worth failing on -- and the same command line twice is
+            # how you find out whether a diagnostic repeats per invocation or per
+            # option.
+            @{ name = 'I: /options:strict alone (the capability probe''s own command line)';
+               args = @('/nologo','/c','/options:strict',"/Fo$env:RUNNER_TEMP\gt_i.obj",'probe.c') },
+            @{ name = 'J: /fsanitize=address again (is C5072 per call or per option?)';
+               args = @('/nologo','/c','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_j.obj",'probe.c') },
+            @{ name = 'K: /analyze (does this edition answer D9040?)';
+               args = @('/nologo','/c','/analyze',"/Fo$env:RUNNER_TEMP\gt_k.obj",'probe.c') }
           )
           foreach ($probe in $probes) {
             $out = "$env:RUNNER_TEMP\gt.out"
@@ -176,6 +201,42 @@ jobs:
             }
           }
 
+          # Can a fix learn about /options:strict for free, from the `cl -?` option
+          # list that _check_from_arglist() already fetches and caches? Two things
+          # have to hold: -? has to print it, and it has to survive the parser there,
+          # which tokenizes with (/[%-%a%d]+)\s+ and so stops at ':' -- it would read
+          # '/options' plus 'strict' and never key on 'options:strict'.
+          #
+          # The exit code is measured too, because _check_from_arglist calls
+          # vstool.iorunv for it and that wrapper raises on a non-zero exit.
+          $qout = "$env:RUNNER_TEMP\q.out"
+          $qerr = "$env:RUNNER_TEMP\q.err"
+          Remove-Item $qout,$qerr -ErrorAction SilentlyContinue
+          Write-Host "=== L: cl -? (the option list xmake already caches)"
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $p = Start-Process -FilePath $cl -ArgumentList @('-?') -NoNewWindow -PassThru `
+                -RedirectStandardOutput $qout -RedirectStandardError $qerr
+          $exited = $false
+          while ($sw.ElapsedMilliseconds -lt $capMs) {
+            if ($p.WaitForExit(200)) { $exited = $true; break }
+          }
+          $sw.Stop()
+          if (-not $exited) {
+            Write-Host "TIMEOUT: still running at the ${capMs} ms cap, killing it"
+            try { $p.Kill($true); $p.WaitForExit(5000) | Out-Null } catch {}
+          }
+          Write-Host "exit: $(if ($exited) { $p.ExitCode } else { 'n/a (killed at the cap)' }) after $($sw.ElapsedMilliseconds) ms"
+          Write-Host "lines: $((Get-Content $qout).Count)"
+          foreach ($needle in @('options:strict', 'fsanitize', 'analyze')) {
+            $hits = Select-String -Path $qout -Pattern $needle -SimpleMatch -ErrorAction SilentlyContinue
+            if ($hits) {
+              Write-Host "'$needle' is listed:"
+              $hits | ForEach-Object { Write-Host "  |$($_.Line.Trim())" }
+            } else {
+              Write-Host "'$needle' NOT in the -? output"
+            }
+          }
+
           # for the record: is the asan runtime even installed on this runner?
           $asanlib = $null
           foreach ($dir in ($env:LIB -split ';' | Where-Object { $_ })) {
@@ -188,6 +249,18 @@ jobs:
           } else {
             Write-Host "asan runtime: ABSENT from LIB"
           }
+          exit 0
+
+      - name: 'Streams xmake actually sees (measurement, no assertions)'
+        shell: pwsh
+        run: |
+          # The step above is cl answering PowerShell. This is cl answering xmake's
+          # own wrapper, private.tools.vstool.iorunv, which is the only stream
+          # core.tools.cl.has_flags can read -- and it redirects diagnostics through
+          # VS_UNICODE_OUTPUT rather than our stdout, so it is a different question.
+          # Whether the D9002 / D8043 text even reaches outdata decides what a fix can
+          # be written against, and no amount of reading the Lua says so.
+          xmake l check/dump_vstool_output.lua
           exit 0
 
       - name: Flag check (expect the bug)
