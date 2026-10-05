@@ -170,7 +170,43 @@ jobs:
             @{ name = 'J: /fsanitize=address again (is C5072 per call or per option?)';
                args = @('/nologo','/c','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_j.obj",'probe.c') },
             @{ name = 'K: /analyze (does this edition answer D9040?)';
-               args = @('/nologo','/c','/analyze',"/Fo$env:RUNNER_TEMP\gt_k.obj",'probe.c') }
+               args = @('/nologo','/c','/analyze',"/Fo$env:RUNNER_TEMP\gt_k.obj",'probe.c') },
+            # M-R test the one risk the /options:strict gate has been asserted but
+            # not measured: an option cl KNOWS but that means nothing on a compile
+            # only line. A linker-only option is the natural candidate, and if
+            # strict escalated it from exit 0 to non-zero, a fix that adds strict to
+            # the probe line would start answering "unsupported" for flags a real
+            # build uses fine.
+            #
+            # D/E/H already say strict does not escalate a bad VALUE (D9014) or an
+            # override conflict (D9025); this asks whether it escalates a misplaced
+            # but recognized option. Each pair is the same command line with and
+            # without strict, so the only thing that can move the exit code is
+            # strict itself.
+            @{ name = 'M1: /OUT:linker-option, /c line, no strict';
+               args = @('/nologo','/c',"/OUT:$env:RUNNER_TEMP\gt_m.exe","/Fo$env:RUNNER_TEMP\gt_m1.obj",'probe.c') },
+            @{ name = 'M2: same with /options:strict';
+               args = @('/nologo','/c','/options:strict',"/OUT:$env:RUNNER_TEMP\gt_m.exe","/Fo$env:RUNNER_TEMP\gt_m2.obj",'probe.c') },
+            @{ name = 'N1: /SUBSYSTEM:WINDOWS, no strict';
+               args = @('/nologo','/c','/SUBSYSTEM:WINDOWS',"/Fo$env:RUNNER_TEMP\gt_n1.obj",'probe.c') },
+            @{ name = 'N2: same with /options:strict';
+               args = @('/nologo','/c','/options:strict','/SUBSYSTEM:WINDOWS',"/Fo$env:RUNNER_TEMP\gt_n2.obj",'probe.c') },
+            @{ name = 'O1: /NODELIB:nonexistent.lib, no strict';
+               args = @('/nologo','/c','/NODELIB:nonexistent.lib',"/Fo$env:RUNNER_TEMP\gt_o1.obj",'probe.c') },
+            @{ name = 'O2: same with /options:strict';
+               args = @('/nologo','/c','/options:strict','/NODELIB:nonexistent.lib',"/Fo$env:RUNNER_TEMP\gt_o2.obj",'probe.c') },
+            @{ name = 'P1: /LTCG, no strict';
+               args = @('/nologo','/c','/LTCG',"/Fo$env:RUNNER_TEMP\gt_p1.obj",'probe.c') },
+            @{ name = 'P2: same with /options:strict';
+               args = @('/nologo','/c','/options:strict','/LTCG',"/Fo$env:RUNNER_TEMP\gt_p2.obj",'probe.c') },
+            @{ name = 'Q1: /MANIFEST:EMBED, no strict';
+               args = @('/nologo','/c','/MANIFEST:EMBED',"/Fo$env:RUNNER_TEMP\gt_q1.obj",'probe.c') },
+            @{ name = 'Q2: same with /options:strict';
+               args = @('/nologo','/c','/options:strict','/MANIFEST:EMBED',"/Fo$env:RUNNER_TEMP\gt_q2.obj",'probe.c') },
+            @{ name = 'R1: /ENTRY:someSym, no strict';
+               args = @('/nologo','/c','/ENTRY:someSym',"/Fo$env:RUNNER_TEMP\gt_r1.obj",'probe.c') },
+            @{ name = 'R2: same with /options:strict';
+               args = @('/nologo','/c','/options:strict','/ENTRY:someSym',"/Fo$env:RUNNER_TEMP\gt_r2.obj",'probe.c') }
           )
           foreach ($probe in $probes) {
             $out = "$env:RUNNER_TEMP\gt.out"
@@ -261,6 +297,28 @@ jobs:
           # Whether the D9002 / D8043 text even reaches outdata decides what a fix can
           # be written against, and no amount of reading the Lua says so.
           xmake l check/dump_vstool_output.lua
+
+          # Same wrapper, same question, for the linker-only family: an option cl
+          # recognizes but that has no meaning on a -c line. Exit 0 means has_flags
+          # answers "supported" from the text scan; a raise means once
+          # /options:strict is on the probe line such a flag starts answering
+          # "unsupported", which is the risk the gate is being judged on.
+          $env:VSTOOL_CASES = @(
+            ('-out:' + "$env:RUNNER_TEMP\gt_v_out.exe"),
+            ('-options:strict -out:' + "$env:RUNNER_TEMP\gt_v_out.exe"),
+            '-subsystem:windows',
+            '-options:strict -subsystem:windows',
+            '-nodelib:nonexistent.lib',
+            '-options:strict -nodelib:nonexistent.lib',
+            '-ltcg',
+            '-options:strict -ltcg',
+            '-manifest:embed',
+            '-options:strict -manifest:embed',
+            '-entry:someSym',
+            '-options:strict -entry:someSym'
+          ) -join ';'
+          xmake l check/dump_vstool_output.lua
+          Remove-Item Env:VSTOOL_CASES
           exit 0
 
       - name: Flag check (expect the bug)
