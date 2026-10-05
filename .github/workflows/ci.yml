@@ -47,8 +47,9 @@ jobs:
   # language flag survives a plain project build).
   #
   # The ground-truth probes live here rather than in the `fixed` job: they
-  # measure cl.exe, not xmake, both jobs run the same runner image, and they are
-  # the slowest step in the workflow.
+  # measure cl.exe, not xmake, and both jobs run the same runner image. They
+  # cost tens of milliseconds now; the step used to cost 45 minutes because of
+  # how it waited, not because of what it ran (see the step itself).
   # ---------------------------------------------------------------------------
   windows-msvc-original:
     runs-on: windows-latest
@@ -98,9 +99,27 @@ jobs:
           $cl = $env:CL_PROGRAM
           Set-Content -Path probe.c -Value 'int main(void){return 0;}' -Encoding ascii
 
-          # `cl 2>&1` under $ErrorActionPreference='stop' throws a
-          # NativeCommandError in GitHub Actions, so go through Start-Process
-          # with redirected streams instead.
+          # Why this waits the way it does. `cl 2>&1` under
+          # $ErrorActionPreference='stop' throws a NativeCommandError in GitHub
+          # Actions, so the output goes to files -- but Start-Process -Wait with
+          # file redirection costs 900 s PER PROBE here, 45 minutes for three,
+          # with cl having written its answer and exited long before that.
+          # Measured on this image (runner 2.337.0 / image 20260901.588):
+          #
+          #   -Wait inline in the step's own pwsh   never returned (run 37269078391,
+          #                                         cancelled at timeout-minutes: 3;
+          #                                         and run 37248020220, 900 s x3)
+          #   -Wait in a pwsh this step spawns      134 ms      (run 37268791353)
+          #   -PassThru + WaitForExit(ms) inline     38-256 ms   (run 37268371898)
+          #   the same cl.exe, launched by xmake     ms           (the flag check below)
+          #
+          # So the stall belongs to -Wait in this process context, not to cl --
+          # and /xx, which fails instantly, stalls exactly as long as the compile
+          # probes, which is what rules cl out. -Wait also has no timeout
+          # parameter, so a wait that never observes the exit costs whatever it
+          # costs. Polling WaitForExit with a deadline is the same wait, bounded,
+          # and announcing the call first means a stall says which probe it is at.
+          $capMs = 60000
           $probes = @(
             @{ name = 'A: /fsanitize=address, no debug info (xmake''s probe shape)';
                args = @('/nologo','/c','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_a.obj",'probe.c') },
@@ -113,10 +132,22 @@ jobs:
             $out = "$env:RUNNER_TEMP\gt.out"
             $err = "$env:RUNNER_TEMP\gt.err"
             Remove-Item $out,$err -ErrorAction SilentlyContinue
-            $p = Start-Process -FilePath $cl -ArgumentList $probe.args -NoNewWindow -Wait -PassThru `
-                  -RedirectStandardOutput $out -RedirectStandardError $err
             Write-Host "=== $($probe.name)"
-            Write-Host "exit: $($p.ExitCode)"
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $p = Start-Process -FilePath $cl -ArgumentList $probe.args -NoNewWindow -PassThru `
+                  -RedirectStandardOutput $out -RedirectStandardError $err
+            $exited = $false
+            while ($sw.ElapsedMilliseconds -lt $capMs) {
+              if ($p.WaitForExit(200)) { $exited = $true; break }
+            }
+            $sw.Stop()
+            if (-not $exited) {
+              Write-Host "TIMEOUT: still running at the ${capMs} ms cap, killing it"
+              try { $p.Kill($true); $p.WaitForExit(5000) | Out-Null } catch {}
+            }
+            # ExitCode is only trustworthy once the exit was actually observed.
+            $code = if ($exited) { $p.ExitCode } else { 'n/a (killed at the cap)' }
+            Write-Host "exit: $code  after $($sw.ElapsedMilliseconds) ms"
             Write-Host "stdout (this is what xmake parses):"
             Get-Content $out | ForEach-Object { Write-Host "  |$_" }
             $errlines = Get-Content $err -ErrorAction SilentlyContinue

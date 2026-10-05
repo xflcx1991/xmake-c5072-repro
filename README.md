@@ -267,8 +267,19 @@ No stub, no PATH tricks anywhere — xmake resolves cl through the cached VS
 environment to an absolute path, so shadowing could never work, and it is not
 needed: the probe shape alone triggers C5072.
 
-Three gotchas worth knowing:
+Four gotchas worth knowing:
 
+* `Start-Process -Wait` costs **900 s per cl probe** when it runs inline in the
+  runner's own step pwsh, which is what made this job take 45 minutes for three
+  probes. It is not the compiler: cl writes its answer and exits in tens of
+  milliseconds, and `-Wait` simply never observes that. Measured on the same
+  image and the same `cl.exe`, `-Wait` inline never returned at all (job had to
+  be cancelled at its timeout), the identical call inside a pwsh that step
+  spawns returned in 134 ms, and `-PassThru` plus a polled `WaitForExit(ms)`
+  returns inline in 38-256 ms. `/xx` stalls exactly as long as the two compile
+  probes, which is what rules cl out. `-Wait` also has no timeout parameter, so
+  the ground-truth step polls with a deadline instead and prints the call it is
+  about to make before making it.
 * `setup-xmake`'s `getInstallerUrl` only `core.warning()`s when a release asset
   404s and then **silently downgrades to the previous version**, so every
   `original` job hard-asserts that `xmake --version` really contains
