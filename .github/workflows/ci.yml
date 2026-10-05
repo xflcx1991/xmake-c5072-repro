@@ -6,14 +6,34 @@ on:
   workflow_dispatch:
 
 env:
+  # the release the bug was reported against, and the branch that fixes it
   XMAKE_VERSION: "3.1.1"
+  FIX_REPO: xflcx1991/xmake
+  FIX_BRANCH: fix-cl-c5072
 
+# -----------------------------------------------------------------------------
+# Six jobs: three platforms x {original, fixed}.
+#
+#   *-original  installs the official xmake release through
+#               xmake-io/github-action-setup-xmake, then asserts that the
+#               UNPATCHED oracle is the one in os.programdir().
+#   *-fixed     builds xmake from the fix branch, then asserts that the PATCHED
+#               oracle is the one in os.programdir().
+#
+# Nothing patches an installed xmake in place any more, so every job tests
+# exactly one xmake and the job name says which one.
+#
+# Only Windows shows a difference between the two, because that is where the bug
+# lives. The two ubuntu jobs and the two macos jobs are regression controls:
+# both are expected to pass, before and after. They prove the fix does not
+# disturb toolchains that never had the problem.
+# -----------------------------------------------------------------------------
 jobs:
   # ---------------------------------------------------------------------------
-  # Windows / MSVC -- the platform where the bug actually bites, proven here
-  # against the runner's REAL cl.exe (no stub, no PATH tricks: xmake resolves
-  # cl through the cached VS environment to an absolute path, so shadowing
-  # could never work anyway -- and it is not needed):
+  # Windows / MSVC, the original xmake -- the platform where the bug actually
+  # bites, proven here against the runner's REAL cl.exe (no stub, no PATH
+  # tricks: xmake resolves cl through the cached VS environment to an absolute
+  # path, so shadowing could never work anyway -- and it is not needed):
   #
   #   <src> : warning C5072: ASAN enabled without debug information emission.
   #           Enable debug info for better ASAN error reporting
@@ -21,28 +41,40 @@ jobs:
   # cl prints that and still exits 0 whenever /fsanitize=address is on the
   # command line WITHOUT a debug-info flag (-Zi/-ZI/-Z7), whether or not the
   # asan runtime component is installed. xmake's own probe
-  # (cl -c -nologo <flags> -Fo<o> <src>) has exactly that shape, so stock 3.1.1
-  # mistakes the warning for "flag unsupported". The five flag checks are the
-  # proof; the E2E steps are measurements (see the step comment for why the
+  # (cl -c -nologo <flags> -Fo<o> <src>) has exactly that shape, so the original
+  # 3.1.1 mistakes the warning for "flag unsupported". The five flag checks are
+  # the proof; the E2E step is a measurement (see its comment for why the
   # language flag survives a plain project build).
+  #
+  # The ground-truth probes live here rather than in the `fixed` job: they
+  # measure cl.exe, not xmake, both jobs run the same runner image, and they are
+  # the slowest step in the workflow.
   # ---------------------------------------------------------------------------
-  windows-msvc:
+  windows-msvc-original:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install xmake ${{ env.XMAKE_VERSION }} (official script)
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+
+      - name: 'Assert this is the original xmake ${{ env.XMAKE_VERSION }}'
         shell: pwsh
         run: |
-          $installdir = "$env:RUNNER_TEMP\xmake-$env:XMAKE_VERSION"
-          # psget.text -> scripts/get.ps1 -> xmake-v3.1.1.win64.exe (silent NSIS install)
-          # note: -version must NOT carry the leading 'v', the script does [version]::Parse()
-          & ([ScriptBlock]::Create((irm https://xmake.io/psget.text))) -version $env:XMAKE_VERSION -installdir $installdir
-          # get.ps1 only changes $env:Path for its own session, so re-export it
-          Add-Content $env:GITHUB_PATH $installdir
-          & "$installdir\xmake.exe" --version
+          # setup-xmake's getInstallerUrl only core.warning()s when an asset
+          # 404s and then downgrades to the previous version, so the version has
+          # to be checked rather than trusted.
+          $ver = (xmake --version | Select-Object -First 1)
+          Write-Host "xmake: $ver"
+          if ($ver -notmatch [regex]::Escape($env:XMAKE_VERSION)) {
+            Write-Host "VERDICT: this is not xmake $env:XMAKE_VERSION"
+            exit 1
+          }
+          $env:EXPECT_MODE = 'original'
+          xmake l check/import_module.lua
 
       - name: Locate toolchain
         shell: pwsh
@@ -57,12 +89,11 @@ jobs:
           } else {
             Write-Host "clang-cl: not on PATH, that check will be skipped"
           }
-          Add-Content $env:GITHUB_ENV "FIXED_LUA=$env:GITHUB_WORKSPACE\patches\cl_has_flags.fixed.lua"
 
       - name: 'Ground truth: measure the real cl (no assertions)'
         shell: pwsh
         run: |
-          # Everything below assumes the shape of cl's answer; this is where we
+          # Everything else assumes the shape of cl's answer; this is where we
           # actually find out what it is instead of trusting a guess.
           $cl = $env:CL_PROGRAM
           Set-Content -Path probe.c -Value 'int main(void){return 0;}' -Encoding ascii
@@ -109,13 +140,13 @@ jobs:
           }
           exit 0
 
-      - name: Flag check, stock xmake (expect the bug)
+      - name: Flag check (expect the bug)
         shell: pwsh
         run: |
-          $env:EXPECT_MODE = 'bug'
+          $env:EXPECT_MODE = 'original'
           xmake l check/check_has_flags.lua
 
-      - name: 'E2E, stock xmake (measurement, no assertions)'
+      - name: 'E2E (measurement, no assertions)'
         shell: pwsh
         run: |
           # The flag checks above are the proof. This step only records what a
@@ -130,7 +161,7 @@ jobs:
             xmake f -c -p windows -a x64 -m $mode
             $log = (xmake -v 2>&1 | Out-String)
             Pop-Location
-            Write-Host "=== $mode mode, stock xmake"
+            Write-Host "=== $mode mode, original xmake"
             Write-Host $log
             if ($log -match 'std:c\+\+20|std:c\+\+latest') {
               Write-Host "MEASURE ($mode): the c++20 flag reached the compiler"
@@ -140,22 +171,96 @@ jobs:
           }
           exit 0
 
-      - name: Apply patches/cl_has_flags.fixed.lua over os.programdir()
-        shell: pwsh
-        run: xmake l check/apply_fix.lua
+  # ---------------------------------------------------------------------------
+  # Windows / MSVC, xmake built from the fix branch.
+  #
+  # The same five flag checks and the same E2E build, one xmake later. Here they
+  # are assertions rather than measurements: the c++20 flag must reach cl and
+  # the build must be clean.
+  # ---------------------------------------------------------------------------
+  windows-msvc-fixed:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Flag check, with the fix (expect support)
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      # xmake's C core can only be compiled by an existing xmake, so the release
+      # is installed purely as a bootstrap. Every later step invokes
+      # $env:FIXED_XMAKE by absolute path and never the bare `xmake` on PATH, so
+      # which of the two answers a check cannot be in doubt.
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+
+      - name: Check out the fix branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FIX_REPO }}
+          ref: ${{ env.FIX_BRANCH }}
+          submodules: recursive
+          path: xmake-src
+
+      - name: Build xmake from the fix branch
+        shell: pwsh
+        run: |
+          Push-Location xmake-src
+          git show --stat --oneline HEAD
+          Pop-Location
+
+          # xmake's own windows.yml recipe: build the C core in core/, then drop
+          # the exe into the checkout's xmake/ module dir, where engine.c finds
+          # it by looking for <exedir>/core/_xmake_main.lua.
+          #
+          # Deliberately NOT built with --embed=y: an embedded build unpacks its
+          # modules into a tmpdir, so os.programdir() would point away from the
+          # tree the fix lives in and the assertion below would check nothing.
+          Push-Location xmake-src/core
+          xmake f -c -y -a x64
+          xmake
+          Copy-Item build/xmake.exe ../xmake/xmake.exe
+          Pop-Location
+
+          $progdir = (Resolve-Path xmake-src/xmake).Path
+          Write-Host "fixed xmake: $progdir\xmake.exe"
+          Add-Content $env:GITHUB_ENV "FIXED_XMAKE=$progdir\xmake.exe"
+
+      - name: Assert this is the fixed xmake
+        shell: pwsh
+        run: |
+          & $env:FIXED_XMAKE --version
+          $env:EXPECT_MODE = 'fixed'
+          # the bootstrap release is installed in this job too, so pin which tree
+          # os.programdir() actually resolved to
+          $env:EXPECT_PROGRAMDIR = 'xmake-src'
+          & $env:FIXED_XMAKE l check/import_module.lua
+
+      - name: Locate toolchain
+        shell: pwsh
+        run: |
+          $cl = (Get-Command cl.exe).Source
+          Write-Host "cl: $cl"
+          Add-Content $env:GITHUB_ENV "CL_PROGRAM=$cl"
+          $clangcl = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
+          if ($clangcl) {
+            Write-Host "clang-cl: $($clangcl.Source)"
+            Add-Content $env:GITHUB_ENV "CLANG_CL_PROGRAM=$($clangcl.Source)"
+          } else {
+            Write-Host "clang-cl: not on PATH, that check will be skipped"
+          }
+
+      - name: Flag check (expect support)
         shell: pwsh
         run: |
           $env:EXPECT_MODE = 'fixed'
-          xmake l check/check_has_flags.lua
+          & $env:FIXED_XMAKE l check/check_has_flags.lua
 
-      - name: E2E release mode, with the fix (expect the c++20 flag kept, clean build)
+      - name: E2E release mode (expect the c++20 flag kept, clean build)
         shell: pwsh
         run: |
           Push-Location repro
-          xmake f -c -p windows -a x64 -m release
-          $log = (xmake -v 2>&1 | Out-String)
+          & $env:FIXED_XMAKE f -c -p windows -a x64 -m release
+          $log = (& $env:FIXED_XMAKE -v 2>&1 | Out-String)
           Pop-Location
           Write-Host $log
           if ($log -notmatch 'std:c\+\+20|std:c\+\+latest') {
@@ -169,107 +274,96 @@ jobs:
           Write-Host 'VERDICT: the c++20 flag reached the compiler and the build succeeded'
 
   # ---------------------------------------------------------------------------
-  # Ubuntu, stock xmake installed by the official script.
+  # Ubuntu, the original xmake.
   #
-  # Control group + fix safety, no stub involved:
-  #   * the very same project (c++20 + asan policy) builds cleanly through gcc,
-  #     which shows the Windows breakage is xmake's MSVC flag detection, not
-  #     the project;
-  #   * after the fix is applied over os.programdir(), the patched module still
-  #     imports and normal builds are unaffected on POSIX.
+  # Control group: the very same project (c++20 + asan policy) builds cleanly
+  # through gcc, which shows that the Windows breakage is xmake's MSVC flag
+  # detection and not the project.
   #
-  # (The original stub-driven flag checks are gone: the Windows job proves the
-  # bug against the real cl.exe, which is strictly stronger.)
-  #
-  # Heads up: scripts/get.sh ALWAYS builds from source. With a tag argument it
-  # does `git clone --depth=1 -b v3.1.1 --recurse-submodules` followed by
-  # ./configure && make -j && make install, so this job takes a few minutes.
-  # Its gitrepo is hardcoded to xmake-io/xmake.git, which is why it cannot be
-  # used to install the fork below.
+  # Heads up: on Linux and macOS setup-xmake ALWAYS builds from source -- its
+  # unix-install path runs ./configure && make && make install even for a tag --
+  # so the install step takes a few minutes. That is the same cost the official
+  # shget.text script had.
   # ---------------------------------------------------------------------------
-  ubuntu-stock:
+  ubuntu-original:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install xmake v${{ env.XMAKE_VERSION }} from source (official script)
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+
+      - name: 'Assert this is the original xmake ${{ env.XMAKE_VERSION }}'
         run: |
-          curl -fsSL https://xmake.io/shget.text | bash -s "v$XMAKE_VERSION"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/xmake" --version
+          set -euo pipefail
+          xmake --version
+          xmake --version | head -1 | grep -qF "$XMAKE_VERSION"
+          EXPECT_MODE=original xmake l check/import_module.lua
 
       - name: 'Control build (gcc): the project itself is healthy'
         run: |
+          set -euo pipefail
           cd repro
           xmake f -c -y
-          set -o pipefail
           xmake -v 2>&1 | tee "$RUNNER_TEMP/build.log"
           # both the language flag and the sanitizer flag must reach gcc
           grep -q -- '-std=c++' "$RUNNER_TEMP/build.log"
           grep -q -- '-fsanitize=address' "$RUNNER_TEMP/build.log"
 
-      - name: Apply patches/cl_has_flags.fixed.lua over os.programdir()
-        env:
-          FIXED_LUA: ${{ github.workspace }}/patches/cl_has_flags.fixed.lua
-        run: xmake l check/apply_fix.lua
-
-      - name: Import smoke and rebuild with the fix in place
-        run: |
-          # a gcc build never loads core/tools/cl/has_flags.lua; importing it
-          # forces the patched file to at least parse and load
-          xmake l check/import_module.lua
-          cd repro
-          xmake f -c -y
-          xmake
-
   # ---------------------------------------------------------------------------
-  # Ubuntu, xmake built from the fix branch of the fork.
+  # Ubuntu, xmake built from the fix branch.
   #
-  # Proves the branch itself -- as committed to a real xmake checkout and built
-  # per the development guide -- installs, really carries the fix, and still
-  # builds normal projects, so the patch file cannot have drifted from the
-  # branch.
+  # Proves that the branch itself -- as committed to a real xmake checkout and
+  # built per the development guide -- installs, really carries the fix, and
+  # still builds normal projects. Building from the branch instead of patching a
+  # file in place is what keeps the branch and the tested code from drifting
+  # apart.
   # ---------------------------------------------------------------------------
-  ubuntu-fork-fix:
+  ubuntu-fixed:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/checkout@v4
+      - name: Check out the fix branch
+        uses: actions/checkout@v4
         with:
-          repository: xflcx1991/xmake
-          ref: fix-cl-c5072
+          repository: ${{ env.FIX_REPO }}
+          ref: ${{ env.FIX_BRANCH }}
           submodules: recursive
           path: xmake-src
 
       - name: Build and install xmake from the fix branch
         run: |
+          set -euo pipefail
           cd xmake-src
           git show --stat --oneline HEAD
           ./configure
           make -j"$(nproc)"
           make install PREFIX="$HOME/.local"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/xmake" --version
+          echo "FIXED_XMAKE=$HOME/.local/bin/xmake" >> "$GITHUB_ENV"
 
-      - name: Confirm the branch really carries the fix
-        run: grep -n 'D%d%d%d%d' "$HOME/.local/share/xmake/modules/core/tools/cl/has_flags.lua"
-
-      - name: Control build from the fix branch (gcc)
+      - name: Assert this is the fixed xmake
         run: |
+          set -euo pipefail
+          "$FIXED_XMAKE" --version
+          EXPECT_MODE=fixed EXPECT_PROGRAMDIR="$HOME/.local" "$FIXED_XMAKE" l check/import_module.lua
+
+      - name: 'Control build (gcc): unchanged by the fix'
+        run: |
+          set -euo pipefail
           cd repro
-          xmake f -c -y
-          set -o pipefail
-          xmake -v 2>&1 | tee "$RUNNER_TEMP/build.log"
+          "$FIXED_XMAKE" f -c -y
+          "$FIXED_XMAKE" -v 2>&1 | tee "$RUNNER_TEMP/build.log"
           grep -q -- '-std=c++' "$RUNNER_TEMP/build.log"
           grep -q -- '-fsanitize=address' "$RUNNER_TEMP/build.log"
 
   # ---------------------------------------------------------------------------
-  # macOS arm64, stock xmake from the official script.
-  #
-  # Same control build + fix safety as ubuntu-stock, on AppleClang.
+  # macOS arm64, the original xmake. Same control build as ubuntu, on
+  # AppleClang and arm64 hardware.
   # ---------------------------------------------------------------------------
-  macos-arm64:
+  macos-arm64-original:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -279,29 +373,69 @@ jobs:
           uname -m
           test "$(uname -m)" = "arm64"
 
-      - name: Install xmake v${{ env.XMAKE_VERSION }} from source (official script)
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+
+      - name: 'Assert this is the original xmake ${{ env.XMAKE_VERSION }}'
         run: |
-          curl -fsSL https://xmake.io/shget.text | bash -s "v$XMAKE_VERSION"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/xmake" --version
+          set -euo pipefail
+          xmake --version
+          xmake --version | head -1 | grep -qF "$XMAKE_VERSION"
+          EXPECT_MODE=original xmake l check/import_module.lua
 
       - name: 'Control build (AppleClang): the project itself is healthy'
         run: |
+          set -euo pipefail
           cd repro
           xmake f -c -y
-          set -o pipefail
           xmake -v 2>&1 | tee "$RUNNER_TEMP/build.log"
           grep -q -- '-std=c++' "$RUNNER_TEMP/build.log"
           grep -q -- '-fsanitize=address' "$RUNNER_TEMP/build.log"
 
-      - name: Apply patches/cl_has_flags.fixed.lua over os.programdir()
-        env:
-          FIXED_LUA: ${{ github.workspace }}/patches/cl_has_flags.fixed.lua
-        run: xmake l check/apply_fix.lua
+  # ---------------------------------------------------------------------------
+  # macOS arm64, xmake built from the fix branch.
+  # ---------------------------------------------------------------------------
+  macos-arm64-fixed:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Import smoke and rebuild with the fix in place
+      - name: Assert arm64 hardware
         run: |
-          xmake l check/import_module.lua
+          uname -m
+          test "$(uname -m)" = "arm64"
+
+      - name: Check out the fix branch
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FIX_REPO }}
+          ref: ${{ env.FIX_BRANCH }}
+          submodules: recursive
+          path: xmake-src
+
+      - name: Build and install xmake from the fix branch
+        run: |
+          set -euo pipefail
+          cd xmake-src
+          git show --stat --oneline HEAD
+          ./configure
+          make -j"$(sysctl -n hw.ncpu)"
+          make install PREFIX="$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "FIXED_XMAKE=$HOME/.local/bin/xmake" >> "$GITHUB_ENV"
+
+      - name: Assert this is the fixed xmake
+        run: |
+          set -euo pipefail
+          "$FIXED_XMAKE" --version
+          EXPECT_MODE=fixed EXPECT_PROGRAMDIR="$HOME/.local" "$FIXED_XMAKE" l check/import_module.lua
+
+      - name: 'Control build (AppleClang): unchanged by the fix'
+        run: |
+          set -euo pipefail
           cd repro
-          xmake f -c -y
-          xmake
+          "$FIXED_XMAKE" f -c -y
+          "$FIXED_XMAKE" -v 2>&1 | tee "$RUNNER_TEMP/build.log"
+          grep -q -- '-std=c++' "$RUNNER_TEMP/build.log"
+          grep -q -- '-fsanitize=address' "$RUNNER_TEMP/build.log"

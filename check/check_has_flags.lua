@@ -1,6 +1,6 @@
 -- Drives xmake's REAL flag detection (lib.detect.has_flags ->
 -- core.tools.cl.has_flags) against a cl-shaped compiler and compares the result
--- with what stock 3.1.1 vs. the patched module produce.
+-- with what the original 3.1.1 vs. the fixed build produce.
 --
 -- Nothing here is mocked except the compiler choice: the detection code, the
 -- caching and the output filtering are all xmake's own.
@@ -16,54 +16,54 @@
 --                     raw material, no stub needed.
 --   CLANG_CL_PROGRAM  path of a clang-cl for the unaffected-baseline case
 --                     (optional; the case is skipped when absent)
---   EXPECT_MODE       "bug"   -> assert the stock xmake 3.1.1 results
---                     "fixed" -> assert the results with patches/ applied
---   REPORT_ONLY       when set, print what has_flags returns but never fail
---                     (used by the Windows ground-truth steps)
+--   EXPECT_MODE       "original" -> assert the unpatched xmake 3.1.1 results
+--                     "fixed"    -> assert the results of the fixed build
+--   REPORT_ONLY       when set, print what has_flags returns but never fail.
+--                     a manual-debugging affordance; no CI step uses it.
 
 import("lib.detect.has_flags")
 
 local cl_program = os.getenv("CL_PROGRAM")
 local clang_cl_program = os.getenv("CLANG_CL_PROGRAM")
-local mode = os.getenv("EXPECT_MODE") or "bug"
+local mode = os.getenv("EXPECT_MODE") or "original"
 local report_only = os.getenv("REPORT_ONLY") ~= nil
 
 if not cl_program then
     os.raise("CL_PROGRAM must point at the cl to check against")
 end
-if mode ~= "bug" and mode ~= "fixed" then
-    os.raise("EXPECT_MODE must be 'bug' or 'fixed', got '%s'", mode)
+if mode ~= "original" and mode ~= "fixed" then
+    os.raise("EXPECT_MODE must be 'original' or 'fixed', got '%s'", mode)
 end
 
 local asan = {"-fsanitize=address"}
 
--- expected[i] = {bug = <stock 3.1.1>, fixed = <with the patch>}
+-- expected[i] = {original = <unpatched 3.1.1>, fixed = <the fixed build>}
 local cases = {
     {
         tool = "cl", flags = {"-fsanitize=address"},
-        expected = {bug = false, fixed = true},
+        expected = {original = false, fixed = true},
         why = "cl supports /fsanitize; C5072 only says the probe line has no debug info (-Zi)",
     },
     {
         tool = "clang-cl", flags = {"-fsanitize=address"}, use_clang_cl = true,
-        expected = {bug = true, fixed = true},
+        expected = {original = true, fixed = true},
         why = "core/tools/clang_cl/has_flags.lua only looks at the exit code, so it was never affected",
     },
     {
         tool = "cl", flags = {"-std:c++17"}, sysflags = asan,
-        expected = {bug = false, fixed = true},
+        expected = {original = false, fixed = true},
         why = "the one that breaks real builds: package on_check flows pass the "
             .. "toolchain flags as sysflags, and every probe after the asan flag "
             .. "leaks in is answered with C5072",
     },
     {
         tool = "cl", flags = {"-FS"}, sysflags = asan,
-        expected = {bug = true, fixed = true},
+        expected = {original = true, fixed = true},
         why = "-FS is hardcoded in core/tools/cl/check_knownargs.lua, so it never reaches the probe",
     },
     {
         tool = "cl", flags = {"-xx"},
-        expected = {bug = false, fixed = false},
+        expected = {original = false, fixed = false},
         why = "genuinely unknown option: D9002 must still be reported, the fix may not swallow it",
     },
 }
@@ -76,15 +76,17 @@ print(string.format("expecting the '%s' results%s", mode, report_only and " (rep
 print("")
 
 local failed = 0
+local checked = 0
 
 local function run_case(c, program)
+    checked = checked + 1
     local want = report_only and nil or c.expected[mode]
     local errors = nil
     local opt = {
         program = program,
         toolkind = "cc",
         flagkind = "cxflags",   -- what core/tools/cl.lua nf_language() passes
-        force = true,     -- never trust a cached result across the two modes
+        force = true,     -- never trust a cached detect result
         -- lib.detect.has_flags only returns the boolean, so grab the
         -- diagnostic through the on_check hook instead
         on_check = function (ok, errs)
@@ -131,11 +133,14 @@ for _, c in ipairs(cases) do
 end
 
 print("")
+if checked == 0 then
+    os.raise("nothing was checked -- every case was skipped, so this run proves nothing")
+end
 if failed > 0 then
-    os.raise("%d of %d checks did not match the '%s' expectations", failed, #cases, mode)
+    os.raise("%d of %d checks did not match the '%s' expectations", failed, checked, mode)
 end
 if report_only then
     print("report only -- no assertions were made")
 else
-    print(string.format("all %d checks match the '%s' expectations", #cases, mode))
+    print(string.format("all %d checks match the '%s' expectations", checked, mode))
 end

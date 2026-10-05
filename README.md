@@ -36,8 +36,8 @@ probe like `cl /nologo /c /fsanitize=address /Fo<o> <src>` with:
 and still exits `0`. The warning fires whenever `/fsanitize=address` is on the
 command line **without a debug-info flag** (`/Zi`, `/ZI`, `/Z7`) — it does not
 mean "ASan is not installed". Because xmake's own probe line
-(`cl -c -nologo <flags> -Fo<o> <src>`) carries no debug-info flag, stock 3.1.1
-reads the warning as "cl does not support `/fsanitize`" on any stock machine.
+(`cl -c -nologo <flags> -Fo<o> <src>`) carries no debug-info flag, the original
+3.1.1 reads the warning as "cl does not support `/fsanitize`" on any machine.
 
 Note the two kinds of command-line diagnostic are genuinely different, and only
 one of them means "unsupported":
@@ -94,8 +94,8 @@ present in 3.1.1.
 
 ### What is measured
 
-The `windows-msvc` job's ground-truth step runs the runner's **real** cl.exe
-with three probe shapes and prints stdout, stderr and exit code for each:
+The `windows-msvc-original` job's ground-truth step runs the runner's **real**
+cl.exe with three probe shapes and prints stdout, stderr and exit code for each:
 
 * A: `/fsanitize=address`, no debug info — xmake's probe shape. Measured: C5072
   on stdout, exit `0`.
@@ -108,14 +108,16 @@ with three probe shapes and prints stdout, stderr and exit code for each:
 It also records whether `clang_rt.asan_dynamic-x86_64.lib` is present in the
 MSVC lib path — on GitHub runners it is, and C5072 fires anyway.
 
-The stock-xmake E2E step is likewise a measurement, not an assertion: it
+The original job's E2E step is likewise a measurement, not an assertion: it
 builds `repro/` in release and debug mode and records whether the c++20 flag
 reaches the compiler (see the caveat above).
 
 ## The fix
 
-`patches/cl_has_flags.fixed.lua` — only fail on driver-level diagnostics,
-matched by their **Dxxxx code**:
+The fix lives on the branch `xflcx1991/xmake@fix-cl-c5072` — v3.1.1 with no
+upstream commits missing, plus two commits whose net diff touches exactly one
+file, `modules/core/tools/cl/has_flags.lua`. Only fail on driver-level
+diagnostics, matched by their **Dxxxx code**:
 
 ```lua
 if #line > 0 and not line:endswith(filename)
@@ -130,34 +132,41 @@ errors are a non-issue here anyway: they exit non-zero and are raised by
 `vstool.iorunv` before the filter runs. Matching the Dxxxx code is also
 locale-stable, unlike localized message words.
 
-`patches/fix-cl-has-flags-c5072.patch` is the same change as a `git apply`-able
-diff against an xmake checkout.
+There is deliberately no copy of the fix in this repository. Every `*-fixed`
+job builds xmake from the branch itself, so the code under test and the code
+proposed upstream cannot drift apart.
 
 ## Layout
 
 ```
 check/check_has_flags.lua   drives xmake's REAL detection against CL_PROGRAM
                             (the real cl.exe on the Windows runner), 5 cases,
-                            asserts either the buggy or the fixed results;
+                            asserts either the original or the fixed results;
                             REPORT_ONLY=1 prints without asserting
-check/apply_fix.lua         copies patches/cl_has_flags.fixed.lua over the
-                            installed xmake's own module tree
-check/import_module.lua     smoke test that the patched module still parses,
-                            loads and really carries the filter (used by the
-                            POSIX jobs, which never invoke cl)
-patches/                    the fix, as a full file and as a diff
+check/import_module.lua     asserts WHICH xmake is running: loads
+                            core.tools.cl.has_flags and checks the oracle in
+                            os.programdir() is the one EXPECT_MODE claims
 repro/                      an actual xmake project (c++20 + asan policy) used
                             for the E2E measurements and the control builds
-.github/workflows/ci.yml    windows-msvc, ubuntu-stock, ubuntu-fork-fix,
-                            macos-arm64
+.github/workflows/ci.yml    six jobs: windows-msvc, ubuntu, macos-arm64,
+                            each x {original, fixed}
 ```
+
+`check/import_module.lua` is what makes the job names trustworthy. The POSIX
+jobs never invoke cl, so the only thing they can prove about the fix is that the
+module tree they are running really carries it; the Windows jobs prove the rest
+behaviourally. It also takes an optional `EXPECT_PROGRAMDIR` substring, because
+the Windows `fixed` job has two xmakes installed at once — the release used as a
+build bootstrap and the one built from the branch.
 
 ## The five checks
 
 Run on the Windows runner against the **real** cl.exe, through xmake's own
-`lib.detect.has_flags` → `core.tools.cl.has_flags` path:
+`lib.detect.has_flags` → `core.tools.cl.has_flags` path. `windows-msvc-original`
+asserts the left column, `windows-msvc-fixed` the right one — same script, same
+runner image, two xmakes:
 
-| # | tool | flags | sysflags | stock 3.1.1 | fixed | why |
+| # | tool | flags | sysflags | original 3.1.1 | fixed | why |
 |---|---|---|---|---|---|---|
 | 1 | `cl` | `-fsanitize=address` | — | `false` | `true` | cl does support `/fsanitize`; C5072 only says the probe line has no debug info |
 | 2 | `clang-cl` | `-fsanitize=address` | — | `true` | `true` | `core/tools/clang_cl/has_flags.lua` only looks at the exit code, so it was never affected (skipped if clang-cl is absent) |
@@ -165,7 +174,9 @@ Run on the Windows runner against the **real** cl.exe, through xmake's own
 | 4 | `cl` | `-FS` | `-fsanitize=address` | `true` | `true` | `-FS` is hardcoded in `core/tools/cl/check_knownargs.lua`, so it never reaches the probe |
 | 5 | `cl` | `-xx` | — | `false` | `false` | genuinely unknown option: D9002 must still be reported, the fix may not swallow it |
 
-Case 5 is the guard against an over-broad fix.
+Case 5 is the guard against an over-broad fix. The script also refuses to pass
+when every case was skipped, so a missing `cl.exe` cannot be mistaken for five
+green checks.
 
 ## Running it locally
 
@@ -173,48 +184,52 @@ Case 5 is the guard against an over-broad fix.
 does **not** accept inline code — everything is configured through environment
 variables.
 
-On a Windows machine with Visual Studio and a stock xmake 3.1.1:
+On a Windows machine with Visual Studio and an unpatched xmake 3.1.1:
 
 ```pwsh
 $env:CL_PROGRAM = (Get-Command cl.exe).Source
 $env:CLANG_CL_PROGRAM = (Get-Command clang-cl.exe).Source   # optional
 
-# asserts the buggy results
-$env:EXPECT_MODE = 'bug'
+# asserts the original (buggy) results
+$env:EXPECT_MODE = 'original'
 xmake l check/check_has_flags.lua
+```
 
-# overwrite the installed module with the fix (keeps a .orig backup)
-$env:FIXED_LUA = "$PWD\patches\cl_has_flags.fixed.lua"
-xmake l check/apply_fix.lua
+Then build the fix branch and aim the same five checks at it:
 
-# now asserts the fixed results
+```pwsh
+git clone --recurse-submodules -b fix-cl-c5072 https://github.com/xflcx1991/xmake.git xmake-src
+
+# xmake's C core can only be built by an existing xmake
+cd xmake-src/core
+xmake f -c -y -a x64
+xmake
+Copy-Item build/xmake.exe ../xmake/xmake.exe   # engine.c looks for the modules
+cd ../..                                       # next to the exe
+
 $env:EXPECT_MODE = 'fixed'
-xmake l check/check_has_flags.lua
+$env:EXPECT_PROGRAMDIR = 'xmake-src'
+& "$PWD\xmake-src\xmake\xmake.exe" l check/check_has_flags.lua
 ```
 
 The probe shape alone triggers C5072 — no stub is involved anywhere; the same
 cl.exe GitHub's runners ship is enough.
 
-Or apply the diff to a source checkout instead:
+`check/import_module.lua` is the cheap half of the same verification and needs
+no compiler at all, which is why it is the only check the POSIX jobs can run:
 
 ```sh
-cd /path/to/xmake
-git apply /path/to/patches/fix-cl-has-flags-c5072.patch
+EXPECT_MODE=original xmake l check/import_module.lua   # an unpatched 3.1.1
+EXPECT_MODE=fixed    xmake l check/import_module.lua   # a built fix branch
 ```
 
-`check/apply_fix.lua` refuses to run if `<os.programdir()>/modules/core/tools/cl/has_flags.lua`
-does not exist, so a wrong `programdir` fails loudly instead of silently testing
-the stock module. Single-file `xmake-bundle-*` builds unpack their modules to a
-tmpdir and `os.programdir()` points there, so it works for those too.
+Do not build the checkout with `--embed=y` if you want to inspect it: an
+embedded binary unpacks its modules into a tmpdir and `os.programdir()` points
+there, so the assertions would be checking a throwaway copy.
 
-On Linux/macOS the same project builds cleanly through gcc/AppleClang (that is
-the control build in the POSIX jobs), and `check/import_module.lua` verifies
-the patched module loads there:
-
-```sh
-FIXED_LUA=$PWD/patches/cl_has_flags.fixed.lua xmake l check/apply_fix.lua
-xmake l check/import_module.lua
-```
+To point an existing xmake binary at a source checkout's module tree without
+building anything, set `XMAKE_PROGRAM_DIR=<checkout>/xmake` — handy for checking
+a working copy that has not been installed.
 
 The end-to-end project:
 
@@ -229,30 +244,43 @@ cache key does not include the version, so a stale result survives otherwise.
 
 ## CI
 
-Four jobs, all using the official install scripts:
+Six jobs: three platforms x {original, fixed}. Nothing patches an installed
+xmake in place any more, so each job tests exactly one xmake and the job name
+says which one — `check/import_module.lua` asserts it before any build runs.
 
-* **windows-msvc** — `psget.text -version 3.1.1 -installdir ...`, then, against
-  the runner's **real** cl.exe (no stub, no PATH tricks — xmake resolves cl via
-  the cached VS environment to an absolute path, so shadowing cannot work):
-  ground-truth probes, the five flag checks in both modes, the E2E
-  measurements, and — with the fix applied — the five checks again plus a
-  release build asserting the c++20 flag is kept and the build is clean.
-* **ubuntu-stock** — `shget.text | bash -s v3.1.1`. Control build through gcc
-  (the project itself is healthy: both `-std=c++` and `-fsanitize=address`
-  reach the compiler), then `apply_fix` + import smoke + rebuild, proving the
-  patched module is loadable and normal builds are unaffected on POSIX.
-* **ubuntu-fork-fix** — builds `xflcx1991/xmake@fix-cl-c5072` from source per
-  the development guide (`./configure && make && make install PREFIX=`), so
-  the branch and the patch file cannot drift apart.
-* **macos-arm64** — same control build + fix safety as ubuntu-stock, on
-  AppleClang, arm64 hardware.
+| job | xmake under test | what it proves |
+|---|---|---|
+| `windows-msvc-original` | the 3.1.1 release, via setup-xmake | the bug, against the runner's **real** cl.exe: ground-truth probes, the five flag checks in `original` mode, the E2E measurement |
+| `windows-msvc-fixed` | built from `fix-cl-c5072` | the same five checks in `fixed` mode, plus a release build asserting the c++20 flag reaches cl and no `error C`/`error LNK` appears |
+| `ubuntu-original` | the 3.1.1 release, via setup-xmake | control build through gcc: `-std=c++` and `-fsanitize=address` both reach the compiler, so the project itself is healthy |
+| `ubuntu-fixed` | built from `fix-cl-c5072` | the same control build, unchanged by the fix |
+| `macos-arm64-original` | the 3.1.1 release, via setup-xmake | the control build on AppleClang / arm64 |
+| `macos-arm64-fixed` | built from `fix-cl-c5072` | the same control build on AppleClang / arm64 |
 
-Two gotchas worth knowing:
+Only Windows differs between the two halves, because that is where the bug lives.
+The ubuntu and macos pairs are regression controls: **both are expected to pass,
+before and after**. They show the fix does not disturb toolchains that never had
+the problem, and they are the only place `import_module.lua` can check the
+patched oracle, since a gcc build never loads `core/tools/cl/has_flags.lua`.
 
-* `scripts/get.ps1` parses the version with `[version]::Parse()`, so pass
-  `-version 3.1.1`, **not** `-version v3.1.1`. It also only mutates `$env:Path`
-  for its own session, so the directory has to be re-exported via
-  `$GITHUB_PATH`.
-* `scripts/get.sh` **always builds from source** (~3-5 min) and its `gitrepo` is
-  hardcoded to `xmake-io/xmake.git` — it cannot install a fork, hence the
-  fork-fix job builds the branch manually.
+No stub, no PATH tricks anywhere — xmake resolves cl through the cached VS
+environment to an absolute path, so shadowing could never work, and it is not
+needed: the probe shape alone triggers C5072.
+
+Three gotchas worth knowing:
+
+* `setup-xmake`'s `getInstallerUrl` only `core.warning()`s when a release asset
+  404s and then **silently downgrades to the previous version**, so every
+  `original` job hard-asserts that `xmake --version` really contains
+  `$XMAKE_VERSION` instead of trusting the action.
+* On Linux and macOS `setup-xmake` **always builds from source** — its
+  unix-install path runs `./configure && make && make install` even for a tag —
+  so the `original` jobs there are as slow as the `fixed` ones. That was equally
+  true of the `shget.text` script this workflow used before.
+* The Windows `fixed` job has two xmakes installed at once, because xmake's C
+  core can only be compiled by an existing xmake. The release is a bootstrap
+  only: every later step invokes `$env:FIXED_XMAKE` by absolute path, and
+  `EXPECT_PROGRAMDIR=xmake-src` pins which tree `os.programdir()` resolved to.
+  For the same reason the branch build must not use `--embed=y` — an embedded
+  binary unpacks its modules into a tmpdir, so the oracle assertion would be
+  reading a throwaway copy.
