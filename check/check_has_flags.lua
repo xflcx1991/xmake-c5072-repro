@@ -22,6 +22,36 @@
 --                     a manual-debugging affordance; no CI step uses it.
 
 import("lib.detect.has_flags")
+import("core.cache.global_detectcache")
+
+-- What does the driver capability gate actually see?
+--
+-- core/tools/cl/has_flags.lua caches `cl -?` per program and reads the
+-- /options:strict gate out of that same entry. The cache key carries no xmake
+-- version, so an entry written by an older xmake -- which never recorded the
+-- field -- is read back by the patched one as "no gate", and the probe silently
+-- falls back to scanning D9002 text. That is a correct answer through a
+-- different mechanism, so nothing in the seven rows below would notice; it has to
+-- be looked at directly.
+--
+-- the key is program .. "_" .. programver and lib.detect.has_flags leaves
+-- programver unset (its assignment is commented out at
+-- xmake/modules/lib/detect/has_flags.lua:67), so it is computed here rather than
+-- guessed. rawget is not in the sandbox, so a missing field is read as nil.
+local function measure_gate(label, program)
+    local allflags = global_detectcache:get2("core.tools.cl.has_flags", program .. "_")
+    if type(allflags) ~= "table" then
+        print(("  gate (%s): no cl -? arglist cached yet"):format(label))
+        return
+    end
+    local count = 0
+    for _ in pairs(allflags) do count = count + 1 end
+    print(string.format("  gate (%s): arglist has %d keys, _options_strict = %s%s",
+        label, count, tostring(allflags._options_strict),
+        allflags._options_strict == nil
+            and "  <-- not recorded by whatever wrote this entry, so the probe has no gate and the text scan answers alone"
+            or ""))
+end
 
 local cl_program = os.getenv("CL_PROGRAM")
 local clang_cl_program = os.getenv("CLANG_CL_PROGRAM")
@@ -90,6 +120,8 @@ print(string.format("xmake %s, programdir %s", xmake.version(), os.programdir())
 print(string.format("cl:        %s", cl_program))
 print(string.format("clang-cl:  %s", clang_cl_program or "(not set, that case will be skipped)"))
 print(string.format("expecting the '%s' results%s", mode, report_only and " (report only, no assertions)" or ""))
+print("gate state before any probe:")
+measure_gate("before", cl_program)
 print("")
 
 local failed = 0
@@ -148,6 +180,10 @@ for _, c in ipairs(cases) do
         run_case(c, program)
     end
 end
+
+print("")
+print("after the checks, the gate the probe line was built with:")
+measure_gate("after", cl_program)
 
 print("")
 if checked == 0 then
