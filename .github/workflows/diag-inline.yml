@@ -1,0 +1,124 @@
+name: diag-inline
+
+# Third experiment. Run 1 (no xmake in the job) and run 2 (the same job history
+# as ci.yml: msvc-dev-cmd, setup-xmake, xmake l, Locate toolchain) both measured
+# cl replying in tens of milliseconds, including the ci.yml call shape replayed
+# in a nested pwsh. Neither reproduced the 900 s stall, and both share ci.yml's
+# runner version (2.337.0) and image (20260901.588).
+#
+# The one thing left untested is the shape the slow step really has: -Wait inline
+# in the runner's own step pwsh, with the process chain step-pwsh -> cl (no
+# intermediate pwsh that could change the inherited handles). This job is
+# ci.yml's windows-msvc-original job, steps 1-7, copied rather than re-derived,
+# with two additions and nothing else changed:
+#
+#   * a marker printed BEFORE each Start-Process, because the original step is
+#     silent for the whole stall and so cannot say which call is waiting, and
+#   * timeout-minutes: 3, so a reproduction costs 3 minutes instead of 45.
+#
+# Expected outcomes: sub-second per probe (the stall needs something beyond this
+# step's own code), or a stall after the last marker seen (the stall is the
+# inline -Wait, and the job gets cancelled at 3 minutes).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - diag-inline
+
+env:
+  XMAKE_VERSION: "3.1.1"
+
+jobs:
+  windows-msvc-original-inline:
+    runs-on: windows-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: ${{ env.XMAKE_VERSION }}
+
+      - name: 'Assert this is the original xmake ${{ env.XMAKE_VERSION }}'
+        shell: pwsh
+        run: |
+          $ver = (xmake --version | Select-Object -First 1)
+          Write-Host "xmake: $ver"
+          if ($ver -notmatch [regex]::Escape($env:XMAKE_VERSION)) {
+            Write-Host "VERDICT: this is not xmake $env:XMAKE_VERSION"
+            exit 1
+          }
+          $env:EXPECT_MODE = 'original'
+          xmake l check/import_module.lua
+
+      - name: Locate toolchain
+        shell: pwsh
+        run: |
+          $cl = (Get-Command cl.exe).Source
+          Write-Host "cl: $cl"
+          Add-Content $env:GITHUB_ENV "CL_PROGRAM=$cl"
+          $clangcl = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
+          if ($clangcl) {
+            Write-Host "clang-cl: $($clangcl.Source)"
+            Add-Content $env:GITHUB_ENV "CLANG_CL_PROGRAM=$($clangcl.Source)"
+          } else {
+            Write-Host "clang-cl: not on PATH, that check will be skipped"
+          }
+
+      - name: 'Ground truth: measure the real cl (no assertions)'
+        shell: pwsh
+        run: |
+          $cl = $env:CL_PROGRAM
+          Set-Content -Path probe.c -Value 'int main(void){return 0;}' -Encoding ascii
+
+          $probes = @(
+            @{ name = 'A: /fsanitize=address, no debug info (xmake''s probe shape)';
+               args = @('/nologo','/c','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_a.obj",'probe.c') },
+            @{ name = 'B: same plus /Zi (a debug-mode target''s shape)';
+               args = @('/nologo','/c','/Zi','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_b.obj",'probe.c') },
+            @{ name = 'C: unknown option /xx (what D9002 looks like here)';
+               args = @('/nologo','/c','/xx',"/Fo$env:RUNNER_TEMP\gt_c.obj",'probe.c') }
+          )
+          foreach ($probe in $probes) {
+            $out = "$env:RUNNER_TEMP\gt.out"
+            $err = "$env:RUNNER_TEMP\gt.err"
+            Remove-Item $out,$err -ErrorAction SilentlyContinue
+            # the two additions, and nothing else changed
+            Write-Host "--- calling Start-Process: $($probe.name)"
+            $elapsed = Measure-Command {
+              $script:p = Start-Process -FilePath $cl -ArgumentList $probe.args -NoNewWindow -Wait -PassThru `
+                    -RedirectStandardOutput $out -RedirectStandardError $err
+            }
+            Write-Host "--- -Wait returned after $([int]$elapsed.TotalMilliseconds) ms: $($probe.name)"
+            Write-Host "=== $($probe.name)"
+            Write-Host "exit: $($script:p.ExitCode)"
+            Write-Host "stdout (this is what xmake parses):"
+            Get-Content $out | ForEach-Object { Write-Host "  |$_" }
+            $errlines = Get-Content $err -ErrorAction SilentlyContinue
+            if ($errlines) {
+              Write-Host "stderr (xmake does not parse this for cl):"
+              $errlines | ForEach-Object { Write-Host "  |$_" }
+            }
+          }
+
+          $asanlib = $null
+          foreach ($dir in ($env:LIB -split ';' | Where-Object { $_ })) {
+            $hit = Get-ChildItem -Path $dir -Filter 'clang_rt.asan_dynamic-x86_64.lib' `
+                   -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { $asanlib = $hit.FullName; break }
+          }
+          if ($asanlib) {
+            Write-Host "asan runtime: PRESENT ($asanlib)"
+          } else {
+            Write-Host "asan runtime: ABSENT from LIB"
+          }
+          exit 0
+
+      - name: Flag check (expect the bug)
+        shell: pwsh
+        run: |
+          $env:EXPECT_MODE = 'original'
+          xmake l check/check_has_flags.lua
