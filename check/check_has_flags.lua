@@ -66,6 +66,23 @@ local cases = {
         expected = {original = false, fixed = false},
         why = "genuinely unknown option: D9002 must still be reported, the fix may not swallow it",
     },
+    {
+        -- the two rows above decide the shape of the filter; these two say where its
+        -- edges are. both outdata strings are measured, from vstool.iorunv against the
+        -- runner's cl 14.51 (run 37328831477, job 111826370215), not guessed.
+        tool = "cl", flags = {"-W5"},
+        expected = {original = false, fixed = true},
+        why = "D9014, a bad VALUE of an option the driver does have: cl assumes /W1, "
+            .. "compiles the stub and exits 0. that is support -- matching every four-digit "
+            .. "D-code is how the v2 fix was wrong",
+    },
+    {
+        tool = "cl", flags = {"-std:c++23"},
+        expected = {original = false, fixed = false},
+        why = "a standard this compiler does not implement comes back as D9002, the same "
+            .. "code as a typo'd option -- narrowing the filter to two codes must not start "
+            .. "calling this supported",
+    },
 }
 
 print("")
