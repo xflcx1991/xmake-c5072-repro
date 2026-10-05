@@ -60,14 +60,18 @@ end
 -- since -nologo only suppresses the banner), so we need to filter it out.
 --
 -- and we should only fail on driver-level option diagnostics (Command line warning
--- D9xxx, e.g. D9002 for unknown options) and errors, because frontend warnings such
--- as C5072 are benign and still exit 0: cl prints
+-- D9xxx, e.g. D9002 for unknown options), matching their Dxxxx code rather than any
+-- word in the message text. frontend warnings such as C5072 are benign and still
+-- exit 0: cl prints
 --   <src> : warning C5072: ASAN enabled without debug information emission. Enable
 --           debug info for better ASAN error reporting
 -- whenever -fsanitize=address is given without a debug-info flag (-Zi/-ZI/-Z7),
 -- whether or not the asan runtime component is installed. the has_flags probe line
 -- itself carries no debug info, so once the asan flag leaks into sysflags every
--- probe answers with this warning.
+-- probe answers with this warning. a plain text search for "error" cannot be used
+-- to catch real errors here: the C5072 message itself ends with "...for better ASAN
+-- error reporting", and hard errors exit non-zero and are raised before us anyway.
+-- matching the Dxxxx code is also locale-stable, unlike localized message words.
 --
 -- e.g.
 --   cl_has_flags_xxx.c                                              <-- the filename echo, skip it
@@ -80,7 +84,7 @@ function _get_output(outdata, sourcefile)
     for _, line in ipairs((outdata or ""):split("\n", {plain = true})) do
         line = line:rtrim()
         if #line > 0 and not line:endswith(filename)
-            and (line:find("error", 1, true) or line:find("D%d%d%d%d")) then
+            and line:find("D%d%d%d%d") then
             table.insert(output, line)
         end
     end

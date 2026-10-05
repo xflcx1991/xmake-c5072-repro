@@ -114,12 +114,21 @@ reaches the compiler (see the caveat above).
 
 ## The fix
 
-`patches/cl_has_flags.fixed.lua` — only fail on driver-level diagnostics:
+`patches/cl_has_flags.fixed.lua` — only fail on driver-level diagnostics,
+matched by their **Dxxxx code**:
 
 ```lua
 if #line > 0 and not line:endswith(filename)
-    and (line:find("error", 1, true) or line:find("D%d%d%d%d")) then
+    and line:find("D%d%d%d%d") then
 ```
+
+Matching the plain word "error" does not work — that was the first version of
+this fix, and CI falsified it: the C5072 message itself ends with "...for
+better ASAN **error** reporting", so the benign warning was still counted as a
+diagnostic and every asan-flagged probe still answered "unsupported". Hard
+errors are a non-issue here anyway: they exit non-zero and are raised by
+`vstool.iorunv` before the filter runs. Matching the Dxxxx code is also
+locale-stable, unlike localized message words.
 
 `patches/fix-cl-has-flags-c5072.patch` is the same change as a `git apply`-able
 diff against an xmake checkout.

@@ -21,4 +21,9 @@ assert(src:find(needle, 1, true),
 assert(not src:find("if #line > 0 and not line:endswith(filename) then", 1, true),
     "installed core/tools/cl/has_flags.lua still carries the stock any-line-is-an-answer filter")
 
+-- and so must the falsified v1 fix: matching the plain word "error" flags the C5072
+-- message itself, which ends with "...for better ASAN error reporting"
+assert(not src:find('line:find("error"', 1, true),
+    "installed core/tools/cl/has_flags.lua still matches message text -- the C5072 warning would be flagged again")
+
 print("import smoke ok: core.tools.cl.has_flags loads, patched _get_output is live in " .. os.programdir())
