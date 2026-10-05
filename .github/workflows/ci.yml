@@ -126,7 +126,26 @@ jobs:
             @{ name = 'B: same plus /Zi (a debug-mode target''s shape)';
                args = @('/nologo','/c','/Zi','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_b.obj",'probe.c') },
             @{ name = 'C: unknown option /xx (what D9002 looks like here)';
-               args = @('/nologo','/c','/xx',"/Fo$env:RUNNER_TEMP\gt_c.obj",'probe.c') }
+               args = @('/nologo','/c','/xx',"/Fo$env:RUNNER_TEMP\gt_c.obj",'probe.c') },
+            # /options:strict makes cl EXIT NON-ZERO on an unrecognized option
+            # (error D8043) instead of warning D9002 + exit 0. If that holds on
+            # this toolset, "unsupported" stops being a text-parsing question and
+            # can be an exit-code one -- which is what has_flags should use.
+            #
+            # /W5 is the case that tests whether "unrecognized option" is really
+            # the only failure mode: here the option IS recognized and only its
+            # value is bad (cl: warning D9014, "invalid value for /W; assuming 1"),
+            # so D8043 and D9002 alone cannot cover the invalid-argument family.
+            @{ name = 'D: /W5, recognized option with an invalid value';
+               args = @('/nologo','/c','/W5',"/Fo$env:RUNNER_TEMP\gt_d.obj",'probe.c') },
+            @{ name = 'E: /options:strict + /W5 (does strict cover bad values?)';
+               args = @('/nologo','/c','/options:strict','/W5',"/Fo$env:RUNNER_TEMP\gt_e.obj",'probe.c') },
+            @{ name = 'F: /options:strict + /xx (expect D8043 and a non-zero exit)';
+               args = @('/nologo','/c','/options:strict','/xx',"/Fo$env:RUNNER_TEMP\gt_f.obj",'probe.c') },
+            @{ name = 'G: /options:strict + /fsanitize=address (must still exit 0, C5072 stays a warning)';
+               args = @('/nologo','/c','/options:strict','/fsanitize=address',"/Fo$env:RUNNER_TEMP\gt_g.obj",'probe.c') },
+            @{ name = 'H: /options:strict + /W4 /W3 (accepted-but-overridden: D9025 under strict?)';
+               args = @('/nologo','/c','/options:strict','/W4','/W3',"/Fo$env:RUNNER_TEMP\gt_h.obj",'probe.c') }
           )
           foreach ($probe in $probes) {
             $out = "$env:RUNNER_TEMP\gt.out"
