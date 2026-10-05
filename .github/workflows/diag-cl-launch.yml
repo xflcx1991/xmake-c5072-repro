@@ -1,0 +1,169 @@
+name: diag-cl-launch
+
+# Throwaway job: ci.yml's ground-truth step costs 3 x ~900 s, one 15-minute
+# stall per cl probe. This measures the same command line under several launch
+# shapes with every wait capped, so the stall either reproduces here (and we
+# see which layer waits) or does not.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 'Timing of cl.exe under different launch shapes (waits capped)'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $cl = (Get-Command cl.exe).Source
+          $src = Join-Path (Get-Location) 'probe.c'
+          Set-Content -Path $src -Value 'int main(void){return 0;}' -Encoding ascii
+          Write-Host "pwsh: $($PSVersionTable.PSVersion)"
+          Write-Host "cl:   $cl"
+          Write-Host "src:  $src"
+
+          function Get-SharedText([string]$Path) {
+            # Read a file another process is still writing: open with
+            # FileShare.ReadWrite, which Get-Content does not do.
+            if (-not (Test-Path $Path)) { return '' }
+            try {
+              $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+              try { (New-Object IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Dispose() }
+            } catch { return '' }
+          }
+
+          function Invoke-Capped {
+            param([string]$Name, [string]$Exe, [string[]]$ArgList, [int]$CapMs = 30000)
+            $tag = $Name -replace '[^A-Za-z0-9]', ''
+            $outFile = Join-Path $env:RUNNER_TEMP "diag_${tag}_out.txt"
+            $errFile = Join-Path $env:RUNNER_TEMP "diag_${tag}_err.txt"
+            Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
+
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            # Start-Process -PassThru WITHOUT -Wait: the ci.yml call shape, with
+            # the unbounded wait replaced by our own capped one.
+            $p = Start-Process -FilePath $Exe -ArgumentList $ArgList -NoNewWindow -PassThru `
+                  -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+            $exited = $false
+            while ($sw.ElapsedMilliseconds -lt $CapMs) {
+              if ($p.WaitForExit(250)) { $exited = $true; break }
+            }
+            $sw.Stop()
+
+            Write-Host "=== $Name"
+            if ($exited) {
+              Write-Host ("  process gone: YES after {0} ms, exit code {1}" -f $sw.ElapsedMilliseconds, $p.ExitCode)
+            } else {
+              Write-Host ("  process gone: NO, still alive at the {0} ms cap" -f $CapMs)
+              $rel = @(Get-Process -Name cl, mspdbsrv, vctip, c1xx -ErrorAction SilentlyContinue)
+              $relText = ($rel | ForEach-Object { "$($_.ProcessName)=$($_.Id)" }) -join ' '
+              Write-Host "  related processes now: $relText"
+              try { $p.Kill($true); $p.WaitForExit(5000) | Out-Null } catch {}
+            }
+            $o = Get-SharedText $outFile
+            $e = Get-SharedText $errFile
+            Write-Host ("  stdout: {0}" -f ($o -replace '\r?\n', ' | '))
+            Write-Host ("  stderr: {0}" -f ($e -replace '\r?\n', ' | '))
+          }
+
+          $obj = Join-Path $env:RUNNER_TEMP 'diag.obj'
+          $cmdexe = Join-Path $env:SystemRoot 'System32\cmd.exe'
+          $asan = @('/nologo', '/c', '/fsanitize=address', "/Fo$obj", $src)
+
+          Invoke-Capped -Name 'control trivial exe via cmd ver' `
+                         -Exe $cmdexe -ArgList @('/c', 'ver')
+          Invoke-Capped -Name 'cl plain compile, no asan flag' `
+                         -Exe $cl -ArgList @('/nologo', '/c', "/Fo$obj", $src)
+          Invoke-Capped -Name 'cl asan probe A shape, ci.yml probe 1' `
+                         -Exe $cl -ArgList $asan
+          Invoke-Capped -Name 'cl unknown option xx, ci.yml probe 3' `
+                         -Exe $cl -ArgList @('/nologo', '/c', '/xx', "/Fo$obj", $src)
+
+          # cl wrapped in a .bat (so no quoting rules in the way), output
+          # redirected by the shell rather than by Start-Process handles.
+          $bat = Join-Path $env:RUNNER_TEMP 'diag_wrap.bat'
+          $batOut = Join-Path $env:RUNNER_TEMP 'diag_wrap_out.txt'
+          "@echo off`r`n`"$cl`" /nologo /c /fsanitize=address /Fo$obj $src > `"$batOut`" 2>&1`r`n" |
+            Set-Content -Path $bat -Encoding ascii
+          Invoke-Capped -Name 'cl through a bat with shell redirection' `
+                         -Exe $cmdexe -ArgList @('/c', $bat)
+          Write-Host ("  bat-captured stdout: {0}" -f ((Get-SharedText $batOut) -replace '\r?\n', ' | '))
+
+          Write-Host '=== direct call, ampersand form, inside a job, capped at 90 s'
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $jb = Start-Job -ScriptBlock {
+            param($cl, $src, $obj)
+            $ErrorActionPreference = 'Continue'
+            $o = & $cl /nologo /c /fsanitize=address "/Fo$obj" $src 2>&1 | Out-String
+            "rc=$LASTEXITCODE out=$($o -replace '\r?\n', ' | ')"
+          } -ArgumentList $cl, $src, (Join-Path $env:RUNNER_TEMP 'diag_job.obj')
+          $done = Wait-Job $jb -Timeout 90
+          $sw.Stop()
+          if ($done) {
+            Write-Host ("  job finished after {0} ms: {1}" -f $sw.ElapsedMilliseconds, ((Receive-Job $jb) -join ' '))
+          } else {
+            Write-Host ("  job STILL RUNNING at {0} ms -- the ampersand call does not return either" -f $sw.ElapsedMilliseconds)
+            Stop-Job $jb
+          }
+          Remove-Job $jb -Force
+
+          # The ci.yml shape, verbatim, in a child pwsh. The parent caps the
+          # child rather than hanging for the full 900 s, and relays the
+          # child's own timestamped lines as they appear -- which shows when the
+          # compiler is actually finished relative to when -Wait returns.
+          # (Built as a line array: a here-string terminator has to sit at
+          # column 0, which the YAML block scalar does not allow.)
+          $childBody = @(
+            '$ErrorActionPreference = ''Continue''',
+            '$cl = $args[0]; $src = $args[1]; $tmp = $args[2]',
+            '$sw = [Diagnostics.Stopwatch]::StartNew()',
+            'Write-Host ("child t={0} ms: calling Start-Process -Wait" -f $sw.ElapsedMilliseconds)',
+            '$p = Start-Process -FilePath $cl -ArgumentList @("/nologo","/c","/fsanitize=address","/Fo$tmp\wc.obj",$src) -NoNewWindow -Wait -PassThru -RedirectStandardOutput "$tmp\wc.out" -RedirectStandardError "$tmp\wc.err"',
+            'Write-Host ("child t={0} ms: -Wait returned, exit={1}" -f $sw.ElapsedMilliseconds, $p.ExitCode)',
+            'Write-Host ("child wc.out: " + ((Get-Content "$tmp\wc.out" -ErrorAction SilentlyContinue) -join " | "))'
+          ) -join "`r`n"
+          $child = Join-Path $env:RUNNER_TEMP 'waitcase.ps1'
+          $childBody | Set-Content -Path $child -Encoding ascii
+
+          $capChildSec = 150
+          $kidOut = Join-Path $env:RUNNER_TEMP 'waitcase_kid.out'
+          $kidErr = Join-Path $env:RUNNER_TEMP 'waitcase_kid.err'
+          Remove-Item $kidOut, $kidErr -ErrorAction SilentlyContinue
+          $pwsh = (Get-Process -Id $PID).Path
+          $kidArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" "{3}"' -f $child, $cl, $src, $env:RUNNER_TEMP
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $cp = Start-Process -FilePath $pwsh -ArgumentList $kidArgs -NoNewWindow -PassThru `
+                -RedirectStandardOutput $kidOut -RedirectStandardError $kidErr
+          $pumped = 0
+          $childExited = $false
+          while ($sw.ElapsedMilliseconds -lt ($capChildSec * 1000)) {
+            $cp.WaitForExit(1000) | Out-Null
+            $text = Get-SharedText $kidOut
+            $lines = @($text -split "\r?\n" | Where-Object { $_ -ne '' })
+            while ($pumped -lt $lines.Count) {
+              Write-Host ("  relay t={0,6:0} ms | {1}" -f $sw.ElapsedMilliseconds, $lines[$pumped])
+              $pumped++
+            }
+            if ($cp.HasExited) { $childExited = $true; break }
+            $n = @(Get-Process -Name cl -ErrorAction SilentlyContinue).Count
+            Write-Host ("  relay t={0,6:0} ms | cl processes alive: {1}" -f $sw.ElapsedMilliseconds, $n)
+          }
+          $sw.Stop()
+
+          Write-Host '=== child pwsh verdict'
+          if ($childExited) {
+            Write-Host ("  the -Wait shape COMPLETED in {0} ms -- it does not reproduce here" -f $sw.ElapsedMilliseconds)
+          } else {
+            Write-Host ("  the -Wait shape is still blocked at the {0} s cap -- reproduced" -f $capChildSec)
+            Get-Process -Name cl, pwsh, mspdbsrv, vctip -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host ("    holding: {0} pid={1} start={2}" -f $_.ProcessName, $_.Id, $_.StartTime.ToString('HH:mm:ss')) }
+            try { $cp.Kill($true); $cp.WaitForExit(5000) | Out-Null } catch {}
+          }
+          $kerr = Get-SharedText $kidErr
+          if ($kerr) { Write-Host ("  child stderr: {0}" -f ($kerr -replace '\r?\n', ' | ')) }
+          exit 0
