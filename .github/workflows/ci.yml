@@ -378,7 +378,7 @@ jobs:
           $env:EXPECT_MODE = 'fixed'
           & $env:FIXED_XMAKE l check/check_has_flags.lua
 
-      - name: 'Flag check, cold detect cache (expect support)'
+      - name: 'Flag check, cold global cache (expect support)'
         shell: pwsh
         run: |
           # The run above answers with whatever the driver capability gate found
@@ -387,26 +387,19 @@ jobs:
           # written by an older xmake -- one that never recorded /options:strict --
           # reads back as "no gate", and the probe falls through to the D9002 text
           # scan. Both answers are correct, which is exactly why the seven rows
-          # cannot tell them apart; the gate line the script prints can.
+          # cannot tell them apart; the gate line and the presence of a 'reported:'
+          # line the script prints can (see the harness for why only a raise shows
+          # up there).
           #
-          # This step deletes the cache and runs the same checks again, which is the
-          # state a first run after a clean install is in. Nothing else changes: the
-          # expectations are identical, because the fix has to hold in both regimes,
-          # and the two runs together say which mechanism answered.
-          #
-          # $HOME/.xmake/cache/detect is one file, not a per-version directory, so
-          # the bootstrap release installed in this job and the fixed build below it
-          # read and write the same one. It is this runner's own scratch state,
-          # regenerated on the next detection, and deleting it reaches nothing else.
-          $detect = Join-Path $HOME '.xmake\cache\detect'
-          if (Test-Path $detect) {
-            $item = Get-Item $detect
-            Write-Host ("clearing {0} ({1} bytes{2})" -f $item.FullName, $item.Length,
-                        $(if ($item.PSIsContainer) { ', directory' } else { '' }))
-            Remove-Item -Recurse -Force $detect
-          } else {
-            Write-Host "no detect cache at $detect -- the run above started cold too"
-          }
+          # XMAKE_GLOBALDIR moves the whole global directory, cache included, to a
+          # directory this job has never written, which is the state a first run
+          # after a clean install is in. Nothing is deleted, neither here nor in the
+          # default cache the run above left behind, and the expectations are
+          # unchanged: the fix has to hold in both regimes, and the two runs
+          # together say which mechanism answered.
+          $cold = Join-Path $env:RUNNER_TEMP ("xmake-globaldir-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+          Write-Host "XMAKE_GLOBALDIR = $cold (default is $HOME\.xmake)"
+          $env:XMAKE_GLOBALDIR = $cold
           $env:EXPECT_MODE = 'fixed'
           & $env:FIXED_XMAKE l check/check_has_flags.lua
 

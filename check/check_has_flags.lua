@@ -22,6 +22,7 @@
 --                     a manual-debugging affordance; no CI step uses it.
 
 import("lib.detect.has_flags")
+import("core.base.global")
 import("core.cache.global_detectcache")
 
 -- What does the driver capability gate actually see?
@@ -34,23 +35,28 @@ import("core.cache.global_detectcache")
 -- different mechanism, so nothing in the seven rows below would notice; it has to
 -- be looked at directly.
 --
--- the key is program .. "_" .. programver and lib.detect.has_flags leaves
--- programver unset (its assignment is commented out at
--- xmake/modules/lib/detect/has_flags.lua:67), so it is computed here rather than
--- guessed. rawget is not in the sandbox, so a missing field is read as nil.
-local function measure_gate(label, program)
-    local allflags = global_detectcache:get2("core.tools.cl.has_flags", program .. "_")
-    if type(allflags) ~= "table" then
-        print(("  gate (%s): no cl -? arglist cached yet"):format(label))
+-- the entry is keyed by however lib.detect.find_tool spells the program path,
+-- which is not what this harness passed in through CL_PROGRAM -- guessing the key
+-- reads back nothing and looks exactly like "no gate". so the whole namespace is
+-- enumerated instead, and the key it really uses is printed with it.
+local function measure_gate(label)
+    local entries = global_detectcache:get("core.tools.cl.has_flags")
+    if type(entries) ~= "table" then
+        print(("  gate (%s): %s holds no cl -? arglist at all"):format(label, global.cachedir()))
         return
     end
     local count = 0
-    for _ in pairs(allflags) do count = count + 1 end
-    print(string.format("  gate (%s): arglist has %d keys, _options_strict = %s%s",
-        label, count, tostring(allflags._options_strict),
-        allflags._options_strict == nil
-            and "  <-- not recorded by whatever wrote this entry, so the probe has no gate and the text scan answers alone"
-            or ""))
+    for key, allflags in pairs(entries) do
+        count = count + 1
+        local size = 0
+        for _ in pairs(allflags or {}) do size = size + 1 end
+        print(string.format("  gate (%s): [%d] key '%s', %d entries, _options_strict = %s",
+            label, count, key, size,
+            tostring(type(allflags) == "table" and allflags._options_strict or nil)))
+    end
+    if count == 0 then
+        print(("  gate (%s): the cl -? namespace in %s is empty"):format(label, global.cachedir()))
+    end
 end
 
 local cl_program = os.getenv("CL_PROGRAM")
@@ -117,11 +123,12 @@ local cases = {
 
 print("")
 print(string.format("xmake %s, programdir %s", xmake.version(), os.programdir()))
+print(string.format("global cache %s", global.cachedir()))
 print(string.format("cl:        %s", cl_program))
 print(string.format("clang-cl:  %s", clang_cl_program or "(not set, that case will be skipped)"))
 print(string.format("expecting the '%s' results%s", mode, report_only and " (report only, no assertions)" or ""))
 print("gate state before any probe:")
-measure_gate("before", cl_program)
+measure_gate("before")
 print("")
 
 local failed = 0
@@ -136,8 +143,17 @@ local function run_case(c, program)
         toolkind = "cc",
         flagkind = "cxflags",   -- what core/tools/cl.lua nf_language() passes
         force = true,     -- never trust a cached detect result
-        -- lib.detect.has_flags only returns the boolean, so grab the
-        -- diagnostic through the on_check hook instead
+        -- lib.detect.has_flags only returns the boolean, so grab the diagnostic
+        -- through the on_check hook instead.
+        --
+        -- and what comes back is itself evidence: core/tools/cl/has_flags.lua ends
+        -- its probe with `return try {...}, errors`, so the try result is adjusted
+        -- to one value and the "flag unsupported" text it returns is dropped --
+        -- only a vstool raise (a non-zero exit) can reach on_check here. measured:
+        -- without /options:strict cl answers an unknown option with D9002 at exit 0,
+        -- with it, D8043 at exit 2. so a 'reported:' line below means the strict
+        -- gate was on the probe line, and its absence across all seven rows means
+        -- every false in this run came from the text scan alone.
         on_check = function (ok, errs)
             errors = errs
             return ok, errs
@@ -183,7 +199,7 @@ end
 
 print("")
 print("after the checks, the gate the probe line was built with:")
-measure_gate("after", cl_program)
+measure_gate("after")
 
 print("")
 if checked == 0 then
