@@ -10,10 +10,9 @@
 -- configured through the environment:
 --
 --   EXPECT_MODE       "original" -> assert the unpatched 3.1.1 oracle is present
---                     "fixed"    -> assert the two-code oracle and the
---                                   /options:strict gate are present, and the
---                                   unpatched, v1 (message text) and v2 (any
---                                   Dxxxx) oracles are all gone (default)
+--                     "fixed"    -> assert the two-code oracle is present, and the
+--                                   unpatched, v1 (message text), v2 (any Dxxxx)
+--                                   and strict-gate shapes are all gone (default)
 --   EXPECT_PROGRAMDIR optional substring that os.programdir() must contain.
 --                     the windows `fixed` job installs a bootstrap xmake too, so
 --                     without this a wrong PATH would silently check the wrong
@@ -53,10 +52,17 @@ end
 local needle_d9002 = '"D9002", 1, true)'
 local needle_d8043 = '"D8043", 1, true)'
 
--- the probe line gets /options:strict only where the driver's own -? list has it,
--- because on one that does not, strict is itself an unknown option and the D9002
--- it earns answers "unsupported" for every probe
-local needle_strict_gate = "_options_strict"
+-- the /options:strict capability gate, measured redundant and then dropped: it
+-- changed which channel carried the answer, never the answer (identical verdicts
+-- with it live and with it off), and it only opens when the detect-cache entry was
+-- written by a gate-aware xmake -- which an upgraded user's is not. asserted
+-- ABSENT, because the same is true of any code that injects the option, and its
+-- comment says why it must stay out.
+--
+-- the quoted dash form is the argv insertion; the prose in the module spells the
+-- option /options:strict, so this cannot hit a comment.
+local needle_strict_gate = '"-options:strict"'
+local needle_strict_field = "_options_strict"
 
 -- the falsified v2 fix: matching ANY four-digit D-code also catches D9014, cl's
 -- "invalid value '5' for '/W'; assuming '1'", and calls a supported option with a
@@ -76,8 +82,10 @@ if mode == "fixed" then
         srcfile .. " does not read D9002 -- this is not the fixed build")
     assert(src:find(needle_d8043, 1, true),
         srcfile .. " does not read D8043 -- this is not the fixed build")
-    assert(src:find(needle_strict_gate, 1, true),
-        srcfile .. " does not gate /options:strict on the driver's own option list")
+    assert(not src:find(needle_strict_gate, 1, true),
+        srcfile .. " injects /options:strict again -- measured redundant, and it never opens on an upgraded cache")
+    assert(not src:find(needle_strict_field, 1, true),
+        srcfile .. " records a driver capability field again -- the gate that read it was measured away")
     assert(not src:find(v2_needle, 1, true),
         srcfile .. " still matches every Dxxxx code -- D9014 would be flagged again")
     assert(not src:find(original_needle, 1, true),
